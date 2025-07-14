@@ -32,11 +32,11 @@ if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
     else
-        # For BIOS + GPT, BIOS boot partition required
+        # BIOS + GPT requires BIOS boot partition
         sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot partition
         sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
-        ROOT_PART="${DISK}2"
         BIOS_BOOT_PART="${DISK}1"
+        ROOT_PART="${DISK}2"
     fi
 else
     echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
@@ -95,7 +95,7 @@ read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TO
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
-genfstab -U /mnt >> /mnt/etc/fstab
+genfstab -U /mnt > /mnt/etc/fstab
 
 # === 13. Chroot Configuration ===
 arch-chroot /mnt /bin/bash <<EOF
@@ -171,37 +171,48 @@ fi
 # Bootloader install
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     pacman -S --noconfirm grub efibootmgr
-    mountpoint -q /boot || mount "$EFI_PART" /boot
+    if ! mountpoint -q /boot; then
+        mount "$EFI_PART" /boot
+    fi
+    echo "EFI partition mounted at /boot:"
+    mount | grep 'on /boot '
+    echo "Installing GRUB for UEFI..."
     grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
+
 else
     pacman -S --noconfirm grub
-    # Check BIOS boot partition for GPT
     BIOS_BOOT_PART="\$(parted $DISK print | grep bios_grub | awk '{print \$1}')"
     if [[ -z "\$BIOS_BOOT_PART" ]]; then
         echo "WARNING: No BIOS boot partition found on $DISK."
         echo "Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun the installer."
         exit 1
     fi
+    echo "Installing GRUB for BIOS..."
     grub-install --target=i386-pc "$DISK"
 fi
 
-# Ensure grub config directory exists
+# Ensure /boot/grub directory exists
 if [[ ! -d /boot/grub ]]; then
+    echo "/boot/grub directory missing, creating it."
     mkdir -p /boot/grub
 fi
 
+echo "Generating grub config file at /boot/grub/grub.cfg ..."
 grub-mkconfig -o /boot/grub/grub.cfg
 
 if [[ -f /boot/grub/grub.cfg ]]; then
     echo "GRUB config generated successfully."
 else
-    echo "Failed to generate GRUB config!"
+    echo "ERROR: Failed to generate GRUB config!"
+    ls -l /boot/grub/
     exit 1
 fi
-
 EOF
 
 # === 14. Cleanup ===
+echo "Unmounting partitions..."
+umount -R /mnt
+
+# === 15. Done ===
 echo "Installation complete!"
-echo "You can chroot to your system with: arch-chroot /mnt"
-echo "Remember to unmount partitions and reboot."
+echo "You can now reboot your system."
