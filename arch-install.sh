@@ -27,19 +27,24 @@ if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
     sgdisk -Z "$DISK"
 
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI
+        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI System
         sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
     else
-        sgdisk -n 1:0:0 -t 1:8300 "$DISK"
-        ROOT_PART="${DISK}1"
+        # For BIOS + GPT, BIOS boot partition required
+        sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot partition
+        sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
+        ROOT_PART="${DISK}2"
+        BIOS_BOOT_PART="${DISK}1"
     fi
 else
     echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
     read -rp "Enter root partition (e.g., /dev/sda2): " ROOT_PART
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
         read -rp "Enter EFI partition (e.g., /dev/sda1): " EFI_PART
+    else
+        BIOS_BOOT_PART=""
     fi
 fi
 
@@ -84,18 +89,18 @@ read -rp "Install sudo and allow wheel group? [y/N]: " INSTALL_SUDO
 read -rp "Install NetworkManager? [y/N]: " INSTALL_NET
 
 # === 11. VMware Tools ===
-read -rp "Running inside VMware? Install open-vm-tools? [y/N]: " INSTALL_VMWARE_TOOLS
+read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TOOLS
 
 # === 12. Base Install ===
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
-# Prepare chroot commands
-cat <<EOF > /mnt/root/arch-setup-chroot.sh
-#!/bin/bash
-set -euo pipefail
+genfstab -U /mnt >> /mnt/etc/fstab
 
-# Timezone and locale
+# === 13. Chroot Configuration ===
+arch-chroot /mnt /bin/bash <<EOF
+set -e
+
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
 
@@ -104,11 +109,11 @@ echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
-# User setup
+# User creation
 useradd -m "$USERNAME"
 echo "$USERNAME:$PASSWORD" | chpasswd
 
-# Sudo setup
+# Sudo
 if [[ "$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm sudo
     usermod -aG wheel "$USERNAME"
@@ -116,7 +121,7 @@ if [[ "$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
 fi
 
 # Desktop Environment
-case "$DE" in
+case $DE in
     GNOME)
         pacman -S --noconfirm gnome gdm
         systemctl enable gdm
@@ -141,12 +146,11 @@ if [[ "$INSTALL_NET" =~ ^[Yy]$ ]]; then
     systemctl enable NetworkManager
 fi
 
-# VMware tools
+# VMware Tools
 if [[ "$INSTALL_VMWARE_TOOLS" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm open-vm-tools
     systemctl enable --now vmtoolsd
 fi
-
 
 # Detect and install video drivers
 if lspci | grep -i 'Intel Corporation' &> /dev/null; then
@@ -164,32 +168,28 @@ if lspci | grep -i 'AMD/ATI' &> /dev/null; then
     pacman -S --noconfirm xf86-video-amdgpu
 fi
 
-
 # Bootloader install
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     pacman -S --noconfirm grub efibootmgr
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+    mountpoint -q /boot || mount "$EFI_PART" /boot
+    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
 else
-    # Check for BIOS boot partition for grub-install
-    if parted $DISK print | grep -q 'bios_grub'; then
-        pacman -S --noconfirm grub
-        grub-install --target=i386-pc "$DISK"
-    else
-        echo "No BIOS boot partition found. Installing GRUB with --force (not recommended)..."
-        pacman -S --noconfirm grub
-        grub-install --target=i386-pc --force "$DISK"
+    pacman -S --noconfirm grub
+    # Check BIOS boot partition for GPT
+    BIOS_BOOT_PART="\$(parted $DISK print | grep bios_grub | awk '{print \$1}')"
+    if [[ -z "\$BIOS_BOOT_PART" ]]; then
+        echo "WARNING: No BIOS boot partition found on $DISK."
+        echo "Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun the installer."
+        exit 1
     fi
+    grub-install --target=i386-pc "$DISK"
 fi
 
 grub-mkconfig -o /boot/grub/grub.cfg
 
 EOF
 
-chmod +x /mnt/root/arch-setup-chroot.sh
-
-# === 13. Chroot and run configuration script ===
-arch-chroot /mnt /root/arch-setup-chroot.sh
-
 # === 14. Done ===
 echo "Installation complete!"
 echo "You can chroot to your system with: arch-chroot /mnt"
+echo "Remember to unmount partitions and reboot."
