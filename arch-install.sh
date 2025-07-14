@@ -143,18 +143,117 @@ select_filesystem() {
 swap_menu() {
     echo "Swap configuration options:"
     echo "1) Swap partition"
-    echo "2) Swapfile"
-    echo "3) No swap"
+    echo "2) Create swap partition automatically"
+    echo "3) Swapfile"
+    echo "4) No swap"
     while true; do
-        read -rp "Select swap option (1-3): " swap_choice
+        read -rp "Select swap option (1-4): " swap_choice
         case $swap_choice in
             1) SWAP_TYPE="partition"; select_swap_partition; break;;
-            2) SWAP_TYPE="file"; break;;
-            3) SWAP_TYPE="none"; break;;
+            2) SWAP_TYPE="auto_partition"; create_swap_partition; break;;
+            3) SWAP_TYPE="file"; break;;
+            4) SWAP_TYPE="none"; break;;
             *) echo "Invalid choice.";;
         esac
     done
 }
+
+select_swap_partition() {
+    info "Here are your partitions on $DISK:"
+    lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DISK" | grep -v loop
+    while true; do
+        read -rp "Enter swap partition device path (e.g., /dev/sda3): " SWAP_PART
+        if [[ ! -b $SWAP_PART ]]; then
+            error "Invalid device. Try again."
+            continue
+        fi
+        FSTYPE=$(blkid -o value -s TYPE "$SWAP_PART" || echo "")
+        if [[ $FSTYPE != "swap" ]]; then
+            echo "Warning: The selected partition is not formatted as swap (detected type: $FSTYPE)."
+            if confirm "Format $SWAP_PART as swap and use it?"; then
+                mkswap "$SWAP_PART"
+                break
+            else
+                continue
+            fi
+        else
+            break
+        fi
+    done
+}
+
+create_swap_partition() {
+    info "Creating a swap partition automatically..."
+
+    # Wipe existing partitions table for safety (optional, but here we keep existing except we add swap partition at end)
+    # We'll create a 2G swap partition at the end of disk
+
+    # Get disk size in sectors
+    SECTORS=$(blockdev --getsz "$DISK")
+
+    # Define swap size in MiB
+    SWAP_SIZE_MB=2048
+    SECTOR_SIZE=512
+    SWAP_SECTORS=$((SWAP_SIZE_MB * 1024 * 1024 / SECTOR_SIZE))
+
+    # Calculate start sector for swap partition (last sectors)
+    # Get last partition end sector
+    LAST_PART_END=$(sgdisk -E "$DISK")
+    SWAP_START=$((LAST_PART_END - SWAP_SECTORS + 1))
+
+    if (( SWAP_START <= 2048 )); then
+        error "Disk too small to create swap partition automatically."
+        return 1
+    fi
+
+    # Create swap partition at end
+    sgdisk -n 0:$SWAP_START:0 -t 0:8200 -c 0:"Swap Partition" "$DISK"
+    partprobe "$DISK"
+
+    # Find new swap partition
+    SWAP_PART=$(lsblk -ln -o NAME,PARTTYPE "$DISK" | grep "8200" | awk '{print "/dev/" $1}' | tail -n1)
+
+    if [[ -z $SWAP_PART ]]; then
+        error "Failed to create swap partition."
+        return 1
+    fi
+
+    info "Formatting $SWAP_PART as swap..."
+    mkswap "$SWAP_PART"
+
+    echo "Swap partition $SWAP_PART created and formatted."
+}
+
+# In the install_base_system function, update the swap setup case:
+
+install_base_system() {
+    info "Starting installation..."
+
+    # ... previous code ...
+
+    # Swap setup
+    case $SWAP_TYPE in
+        partition)
+            info "Setting up swap partition $SWAP_PART"
+            swapon "$SWAP_PART"
+            ;;
+        auto_partition)
+            info "Setting up auto-created swap partition $SWAP_PART"
+            swapon "$SWAP_PART"
+            ;;
+        file)
+            info "Creating swapfile on root"
+            fallocate -l 2G /mnt/swapfile
+            chmod 600 /mnt/swapfile
+            mkswap /mnt/swapfile
+            swapon /mnt/swapfile
+            ;;
+        none) info "No swap will be configured";;
+    esac
+
+    # ... rest of install_base_system code ...
+}
+
 
 select_swap_partition() {
     info "Select existing swap partition or create manually."
