@@ -1,45 +1,36 @@
 #!/bin/bash
 set -euo pipefail
-shopt -s nocasematch
 
-# ----------------------------------------
-# Arch Linux Interactive Installer Script
-# Author: ChatGPT Arch Installer v1.0
-# ----------------------------------------
+# Colors
+RED="\e[31m"
+GREEN="\e[32m"
+CYAN="\e[36m"
+RESET="\e[0m"
 
-# Colors for menu
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+info()    { echo -e "${CYAN}[INFO]${RESET} $*"; }
+success() { echo -e "${GREEN}[OK]${RESET} $*"; }
+error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 
-pause() {
-    read -rp "${YELLOW}Press Enter to continue...${NC}"
+# Ensure root
+[[ $EUID -ne 0 ]] && { error "Run as root"; exit 1; }
+
+# Globals
+BOOT_MODE=""
+DISK=""
+PART_BOOT=""
+PART_ROOT=""
+PART_BIOS=""
+SWAP_PART=""
+SWAP_PART_CREATE=false
+SWAP_SIZE_MB=0
+FILESYS="ext4"
+
+welcome() {
+    echo -e "${CYAN}=== Awesome Arch Installer ===${RESET}"
 }
 
-info() {
-    echo -e "${CYAN}[INFO]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-confirm() {
-    while true; do
-        read -rp "$1 (y/n): " yn
-        case $yn in
-            y|Y ) return 0;;
-            n|N ) return 1;;
-            * ) echo "Please answer y or n.";;
-        esac
-    done
-}
-
-# Detect if UEFI or BIOS
 detect_boot_mode() {
-    if [ -d /sys/firmware/efi/efivars ]; then
+    if [ -d /sys/firmware/efi ]; then
         BOOT_MODE="UEFI"
     else
         BOOT_MODE="BIOS"
@@ -47,623 +38,141 @@ detect_boot_mode() {
     info "Boot mode detected: $BOOT_MODE"
 }
 
-# List available disks for selection
-list_disks() {
-    echo "Available disks:"
-    lsblk -dno NAME,SIZE,MODEL | grep -v sr0 | nl
-}
-
 select_disk() {
-    while true; do
-        list_disks
-        read -rp "Enter disk number to install Arch on (e.g., 1): " disknum
-        disk=$(lsblk -dno NAME | grep -v sr0 | sed -n "${disknum}p")
-        if [[ -b /dev/$disk ]]; then
-            DISK="/dev/$disk"
-            echo "Selected disk: $DISK"
-            if confirm "Are you sure you want to use $DISK? All data will be erased"; then
-                break
-            fi
-        else
-            error "Invalid disk selection."
-        fi
-    done
+    lsblk -dpno NAME,SIZE | grep -v loop
+    read -rp "Enter the full path of the target disk (e.g., /dev/sda): " DISK
+    [[ ! -b "$DISK" ]] && { error "Invalid disk"; exit 1; }
+    read -rp "This will erase all data on $DISK. Continue? (y/N): " confirm
+    [[ $confirm != [yY] ]] && { info "Aborted"; exit 0; }
 }
 
-
-ask_swap_before_partition() {
-    echo "Do you want to create a swap partition? (y/N)"
-    read -r swap_answer
-    if [[ "$swap_answer" =~ ^[Yy]$ ]]; then
-        while true; do
-            read -rp "Enter swap size in MiB (default 2048): " swap_size
-            swap_size=${swap_size:-2048}
-            if [[ "$swap_size" =~ ^[0-9]+$ ]] && (( swap_size > 0 )); then
-                SWAP_SIZE_MB=$swap_size
-                SWAP_PART_CREATE=true
-                break
-            else
-                echo "Please enter a valid positive integer."
-            fi
-        done
-    else
-        SWAP_PART_CREATE=false
-        SWAP_SIZE_MB=0
+ask_swap() {
+    read -rp "Create a swap partition? (y/N): " choice
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        SWAP_PART_CREATE=true
+        read -rp "Enter swap size in MiB (e.g., 2048): " SWAP_SIZE_MB
     fi
 }
 
-
-
-# Partitioning menu
-partition_menu() {
-    echo "Partitioning methods:"
-    echo "1) Automatic GPT partitioning (recommended)"
-    echo "2) Manual partitioning (launch cfdisk)"
-    while true; do
-        read -rp "Select partitioning method (1 or 2): " part_choice
-        case $part_choice in
-            1) auto_partition; break;;
-            2) manual_partition; break;;
-            *) echo "Please enter 1 or 2.";;
-        esac
+ask_filesystem() {
+    echo "Choose filesystem for root partition:"
+    select fs in ext4 btrfs xfs f2fs; do
+        FILESYS=$fs
+        break
     done
 }
 
-# Automatic partitioning function (simple GPT scheme)
-auto_partition() {
-    info "Wiping disk $DISK and creating partitions..."
+partition_disk() {
+    info "Wiping disk and creating partitions..."
     wipefs -a "$DISK"
     sgdisk --zap-all "$DISK"
 
     disk_sectors=$(blockdev --getsz "$DISK")
     sector_size=512
-    if $SWAP_PART_CREATE; then
-        swap_sectors=$((SWAP_SIZE_MB * 1024 * 1024 / sector_size))
-    fi
+    [[ $SWAP_PART_CREATE == true ]] && swap_sectors=$((SWAP_SIZE_MB * 1024 * 1024 / sector_size))
 
-    if [[ $BOOT_MODE == "UEFI" ]]; then
-        # Partition 1: EFI System Partition 512M
+    if [[ "$BOOT_MODE" == "UEFI" ]]; then
         sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI System Partition" "$DISK"
-
-        if $SWAP_PART_CREATE; then
-            root_end=$((disk_sectors - swap_sectors - 2048))  # leave buffer
-            sgdisk -n 2:0:${root_end}s -t 2:8300 -c 2:"Linux root" "$DISK"
-        else
-            sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
-        fi
-
-        PART_BOOT="${DISK}1"
-        PART_ROOT="${DISK}2"
-
-    else
-        # Partition 1: BIOS boot partition 1M
-        sgdisk -n 1:0:+1M -t 1:ef02 -c 1:"BIOS boot partition" "$DISK"
-
         if $SWAP_PART_CREATE; then
             root_end=$((disk_sectors - swap_sectors - 2048))
             sgdisk -n 2:0:${root_end}s -t 2:8300 -c 2:"Linux root" "$DISK"
         else
             sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
         fi
-
+        PART_BOOT="${DISK}1"
+        PART_ROOT="${DISK}2"
+    else
+        sgdisk -n 1:0:+1M -t 1:ef02 -c 1:"BIOS Boot" "$DISK"
+        if $SWAP_PART_CREATE; then
+            root_end=$((disk_sectors - swap_sectors - 2048))
+            sgdisk -n 2:0:${root_end}s -t 2:8300 -c 2:"Linux root" "$DISK"
+        else
+            sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
+        fi
         PART_BIOS="${DISK}1"
         PART_ROOT="${DISK}2"
     fi
 
     if $SWAP_PART_CREATE; then
-        info "Creating swap partition of ${SWAP_SIZE_MB}MiB at end of disk"
-
-        last_part_end=$(parted "$DISK" unit s print | grep '^ ' | tail -n1 | awk '{print $3}' | sed 's/s//')
-        [[ -z $last_part_end ]] && last_part_end=2048
-
-        swap_start=$((last_part_end + 1))
+        last_end=$(parted "$DISK" unit s print | grep '^ ' | tail -n1 | awk '{print $3}' | sed 's/s//')
+        swap_start=$((last_end + 1))
         swap_end=$((swap_start + swap_sectors - 1))
 
         if (( swap_end > disk_sectors )); then
-            error "Not enough space to create swap partition of ${SWAP_SIZE_MB}MiB."
+            error "Not enough space for swap."
             exit 1
         fi
 
         sgdisk -n 0:${swap_start}s:${swap_end}s -t 0:8200 -c 0:"Swap Partition" "$DISK"
         partprobe "$DISK"
-
-        SWAP_PART=$(lsblk -ln -o NAME,PARTTYPE "$DISK" | grep "8200" | awk '{print "/dev/" $1}' | tail -n1)
+        SWAP_PART=$(lsblk -ln -o NAME,PARTTYPE "$DISK" | grep 8200 | awk '{print "/dev/" $1}' | tail -n1)
     fi
 
-    echo "Partitions created:"
+    success "Partitioning complete:"
     lsblk "$DISK"
 }
 
+format_and_mount() {
+    info "Formatting and mounting root partition"
+    mkfs."$FILESYS" "$PART_ROOT"
+    mount "$PART_ROOT" /mnt
 
-manual_partition() {
-    info "Launching cfdisk for manual partitioning..."
-    cfdisk "$DISK"
-    echo "Please make sure you have created necessary partitions."
-    pause
-    # After manual partitioning user will specify partitions later.
-}
-
-# Select filesystem type
-select_filesystem() {
-    echo "Choose filesystem for root partition:"
-    echo "1) ext4 (default, stable)"
-    echo "2) btrfs (advanced, snapshot support)"
-    echo "3) xfs (high performance)"
-    while true; do
-        read -rp "Filesystem choice (1-3): " fs_choice
-        case $fs_choice in
-            1) FS_TYPE="ext4"; break;;
-            2) FS_TYPE="btrfs"; break;;
-            3) FS_TYPE="xfs"; break;;
-            *) echo "Invalid choice.";;
-        esac
-    done
-}
-
-# Swap options
-swap_menu() {
-    echo "Swap configuration options:"
-    echo "1) Swap partition"
-    echo "2) Create swap partition automatically"
-    echo "3) Swapfile"
-    echo "4) No swap"
-    while true; do
-        read -rp "Select swap option (1-4): " swap_choice
-        case $swap_choice in
-            1) SWAP_TYPE="partition"; select_swap_partition; break;;
-            2) SWAP_TYPE="auto_partition"; create_swap_partition; break;;
-            3) SWAP_TYPE="file"; break;;
-            4) SWAP_TYPE="none"; break;;
-            *) echo "Invalid choice.";;
-        esac
-    done
-}
-
-select_swap_partition() {
-    info "Here are your partitions on $DISK:"
-    lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DISK" | grep -v loop
-    while true; do
-        read -rp "Enter swap partition device path (e.g., /dev/sda3): " SWAP_PART
-        if [[ ! -b $SWAP_PART ]]; then
-            error "Invalid device. Try again."
-            continue
-        fi
-        FSTYPE=$(blkid -o value -s TYPE "$SWAP_PART" || echo "")
-        if [[ $FSTYPE != "swap" ]]; then
-            echo "Warning: The selected partition is not formatted as swap (detected type: $FSTYPE)."
-            if confirm "Format $SWAP_PART as swap and use it?"; then
-                mkswap "$SWAP_PART"
-                break
-            else
-                continue
-            fi
-        else
-            break
-        fi
-    done
-}
-
-create_swap_partition() {
-    info "Creating a swap partition automatically..."
-
-    # Disk total sectors
-    local disk_sectors
-    disk_sectors=$(blockdev --getsz "$DISK")
-
-    # Swap size in MiB
-    local swap_size_mb=2048
-    local sector_size=512
-    local swap_sectors=$((swap_size_mb * 1024 * 1024 / sector_size))
-
-    # Find last partition end sector
-    # If no partitions, start after 2048 sectors (1 MiB aligned)
-    local last_part_end
-    last_part_end=$(parted "$DISK" unit s print | grep '^ ' | tail -n1 | awk '{print $3}' | sed 's/s//')
-
-    if [[ -z $last_part_end ]]; then
-        last_part_end=2048
-    fi
-
-    local swap_start=$((last_part_end + 1))
-    local swap_end=$((swap_start + swap_sectors - 1))
-
-    # Check if swap_end fits on disk
-    if (( swap_end > disk_sectors )); then
-        error "Not enough space at the end of $DISK to create a ${swap_size_mb}MiB swap partition."
-        return 1
-    fi
-
-    # Create swap partition
-    sgdisk -n 0:${swap_start}s:${swap_end}s -t 0:8200 -c 0:"Swap Partition" "$DISK"
-    partprobe "$DISK"
-
-    # Find new swap partition (latest with type 8200)
-    SWAP_PART=$(lsblk -ln -o NAME,PARTTYPE "$DISK" | grep "8200" | awk '{print "/dev/" $1}' | tail -n1)
-
-    if [[ -z $SWAP_PART ]]; then
-        error "Failed to create swap partition."
-        return 1
-    fi
-
-    info "Formatting $SWAP_PART as swap..."
-    mkswap "$SWAP_PART"
-
-    echo "Swap partition $SWAP_PART created and formatted."
-}
-
-
-# In the install_base_system function, update the swap setup case:
-
-install_base_system() {
-    info "Starting installation..."
-
-    # ... previous code ...
-
-    # Swap setup
-    case $SWAP_TYPE in
-        partition)
-            info "Setting up swap partition $SWAP_PART"
-            swapon "$SWAP_PART"
-            ;;
-        auto_partition)
-            info "Setting up auto-created swap partition $SWAP_PART"
-            swapon "$SWAP_PART"
-            ;;
-        file)
-            info "Creating swapfile on root"
-            fallocate -l 2G /mnt/swapfile
-            chmod 600 /mnt/swapfile
-            mkswap /mnt/swapfile
-            swapon /mnt/swapfile
-            ;;
-        none) info "No swap will be configured";;
-    esac
-
-    # ... rest of install_base_system code ...
-}
-
-
-select_swap_partition() {
-    info "Select existing swap partition or create manually."
-    lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT | grep swap
-    read -rp "Enter swap partition device path (e.g., /dev/sda3): " SWAP_PART
-    if [[ ! -b $SWAP_PART ]]; then
-        error "Invalid swap partition."
-        select_swap_partition
-    fi
-}
-
-# Encryption option
-encryption_menu() {
-    if confirm "Do you want to enable LUKS encryption for the root partition?"; then
-        ENCRYPTION="yes"
-        read -rp "Enter passphrase for LUKS encryption: " -s LUKS_PASS
-        echo
-    else
-        ENCRYPTION="no"
-    fi
-}
-
-# Network setup
-network_menu() {
-    echo "Network setup options:"
-    echo "1) Wired (DHCP)"
-    echo "2) Wifi"
-    while true; do
-        read -rp "Choose network type (1 or 2): " net_choice
-        case $net_choice in
-            1) NETWORK_TYPE="wired"; break;;
-            2) NETWORK_TYPE="wifi"; break;;
-            *) echo "Invalid choice.";;
-        esac
-    done
-
-    if [[ $NETWORK_TYPE == "wifi" ]]; then
-        info "Scanning for wifi networks..."
-        iw dev | grep Interface | awk '{print $2}' | while read -r iface; do
-            WIFI_IFACE="$iface"
-        done
-        if [[ -z $WIFI_IFACE ]]; then
-            error "No wifi interface found."
-            NETWORK_TYPE="wired"
-            return
-        fi
-
-        wifi_scan_and_connect
-    fi
-}
-
-wifi_scan_and_connect() {
-    echo "Available WiFi networks:"
-    iw "$WIFI_IFACE" scan | grep SSID | awk -F: '{print $2}' | sed 's/^ *//g' | nl
-    while true; do
-        read -rp "Enter the number of the WiFi network to connect: " ssid_num
-        SSID=$(iw "$WIFI_IFACE" scan | grep SSID | awk -F: '{print $2}' | sed 's/^ *//g' | sed -n "${ssid_num}p")
-        if [[ -n $SSID ]]; then
-            echo "Selected SSID: $SSID"
-            break
-        else
-            echo "Invalid selection."
-        fi
-    done
-
-    read -rp "Enter WiFi passphrase for $SSID: " -s WIFI_PASS
-    echo
-
-    info "Connecting to WiFi..."
-    ip link set "$WIFI_IFACE" up
-    wpa_passphrase "$SSID" "$WIFI_PASS" > /etc/wpa_supplicant.conf
-    wpa_supplicant -B -i "$WIFI_IFACE" -c /etc/wpa_supplicant.conf
-    dhcpcd "$WIFI_IFACE"
-    rm /etc/wpa_supplicant.conf
-}
-
-# Kernel selection
-kernel_menu() {
-    echo "Select kernel to install:"
-    echo "1) linux (default)"
-    echo "2) linux-lts"
-    echo "3) linux-hardened"
-    while true; do
-        read -rp "Kernel choice (1-3): " kernel_choice
-        case $kernel_choice in
-            1) KERNEL_PKG="linux"; break;;
-            2) KERNEL_PKG="linux-lts"; break;;
-            3) KERNEL_PKG="linux-hardened"; break;;
-            *) echo "Invalid choice.";;
-        esac
-    done
-}
-
-# Bootloader menu
-bootloader_menu() {
-    echo "Bootloader options:"
-    echo "1) GRUB"
-    if [[ $BOOT_MODE == "UEFI" ]]; then
-        echo "2) systemd-boot (UEFI only)"
-    fi
-    while true; do
-        read -rp "Select bootloader (1 or 2): " boot_choice
-        if [[ $boot_choice == "1" ]]; then
-            BOOTLOADER="grub"
-            break
-        elif [[ $boot_choice == "2" && $BOOT_MODE == "UEFI" ]]; then
-            BOOTLOADER="systemd-boot"
-            break
-        else
-            echo "Invalid choice."
-        fi
-    done
-}
-
-# Desktop Environment menu
-desktop_menu() {
-    echo "Select Desktop Environment:"
-    echo "1) None (CLI only)"
-    echo "2) i3"
-    echo "3) GNOME"
-    echo "4) KDE Plasma"
-    echo "5) XFCE"
-    while true; do
-        read -rp "Choice (1-5): " de_choice
-        case $de_choice in
-            1) DESKTOP_ENV="none"; break;;
-            2) DESKTOP_ENV="i3"; break;;
-            3) DESKTOP_ENV="gnome"; break;;
-            4) DESKTOP_ENV="kde"; break;;
-            5) DESKTOP_ENV="xfce"; break;;
-            *) echo "Invalid choice.";;
-        esac
-    done
-}
-
-# Extra packages menu
-extra_packages_menu() {
-    echo "Select additional package groups to install:"
-    echo "1) None"
-    echo "2) Development tools (gcc, make, git)"
-    echo "3) Multimedia (vlc, mpv, pulseaudio)"
-    echo "4) Networking tools (nmap, net-tools)"
-    echo "You can select multiple by entering numbers separated by spaces (e.g. '2 3'):"
-    read -rp "Your selection: " pkg_choices
-
-    EXTRA_PKGS=()
-    for choice in $pkg_choices; do
-        case $choice in
-            1) break;;
-            2) EXTRA_PKGS+=(base-devel git) ;;
-            3) EXTRA_PKGS+=(vlc mpv pulseaudio pulseaudio-alsa pavucontrol) ;;
-            4) EXTRA_PKGS+=(nmap net-tools) ;;
-            *) echo "Ignoring invalid choice $choice";;
-        esac
-    done
-}
-
-# Locale and timezone
-locale_timezone_menu() {
-    echo "Select your timezone:"
-    timedatectl list-timezones | nl | head -50
-    read -rp "Enter timezone (e.g., Europe/London): " TZONE
-    if ! timedatectl list-timezones | grep -q "^$TZONE$"; then
-        error "Invalid timezone. Using UTC."
-        TZONE="UTC"
-    fi
-
-    read -rp "Enter your locale (e.g., en_US.UTF-8): " LOCALE
-    if [[ -z $LOCALE ]]; then
-        LOCALE="en_US.UTF-8"
-    fi
-
-    read -rp "Enter your hostname: " HOSTNAME
-    if [[ -z $HOSTNAME ]]; then
-        HOSTNAME="archlinux"
-    fi
-}
-
-# Create user account
-create_user() {
-    read -rp "Enter username to create: " USERNAME
-    while true; do
-        read -rsp "Enter password for $USERNAME: " PASS1; echo
-        read -rsp "Confirm password: " PASS2; echo
-        [[ $PASS1 == "$PASS2" ]] && break || echo "Passwords do not match. Try again."
-    done
-}
-
-# Format, mount and install base system
-install_base_system() {
-    info "Starting installation..."
-
-    # Format partitions
-    if [[ $ENCRYPTION == "yes" ]]; then
-        info "Setting up LUKS encryption on root partition $PART_ROOT"
-        echo -n "$LUKS_PASS" | cryptsetup luksFormat "$PART_ROOT" -
-        echo -n "$LUKS_PASS" | cryptsetup open "$PART_ROOT" cryptroot -
-        ROOT_MAPPER="/dev/mapper/cryptroot"
-    else
-        ROOT_MAPPER="$PART_ROOT"
-    fi
-
-    info "Formatting root partition ($ROOT_MAPPER) as $FS_TYPE"
-    case $FS_TYPE in
-        ext4) mkfs.ext4 "$ROOT_MAPPER" ;;
-        btrfs) mkfs.btrfs "$ROOT_MAPPER" ;;
-        xfs) mkfs.xfs "$ROOT_MAPPER" ;;
-    esac
-
-    # Mount root
-    mount "$ROOT_MAPPER" /mnt
-
-    # EFI partition mount
-    if [[ $BOOT_MODE == "UEFI" ]]; then
-        info "Formatting EFI partition $PART_BOOT as FAT32"
+    if [[ -n "$PART_BOOT" ]]; then
         mkfs.fat -F32 "$PART_BOOT"
         mkdir -p /mnt/boot
         mount "$PART_BOOT" /mnt/boot
     fi
 
-    # Swap setup
-    case $SWAP_TYPE in
-        partition)
-            info "Setting up swap partition $SWAP_PART"
-            mkswap "$SWAP_PART"
-            swapon "$SWAP_PART"
-            ;;
-        file)
-            info "Creating swapfile on root"
-            fallocate -l 2G /mnt/swapfile
-            chmod 600 /mnt/swapfile
-            mkswap /mnt/swapfile
-            swapon /mnt/swapfile
-            ;;
-        none) info "No swap will be configured";;
-    esac
-
-    # Install base system
-    info "Installing base system..."
-    pacstrap /mnt base linux linux-firmware "$KERNEL_PKG" sudo vim
-
-    # Generate fstab
-    info "Generating fstab..."
-    genfstab -U /mnt >> /mnt/etc/fstab
-
-    # Configure system inside chroot
-    arch-chroot /mnt /bin/bash <<EOF
-set -e
-echo "$HOSTNAME" > /etc/hostname
-ln -sf /usr/share/zoneinfo/$TZONE /etc/localtime
-hwclock --systohc
-echo "$LOCALE UTF-8" > /etc/locale.gen
-locale-gen
-echo "LANG=$LOCALE" > /etc/locale.conf
-echo "KEYMAP=us" > /etc/vconsole.conf
-useradd -m -G wheel "$USERNAME"
-echo "$USERNAME:$PASS1" | chpasswd
-echo "root:$PASS1" | chpasswd
-echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
-chmod 440 /etc/sudoers.d/wheel
-
-if [[ "$ENCRYPTION" == "yes" ]]; then
-    # Configure mkinitcpio for LUKS
-    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block encrypt filesystems keyboard fsck)/' /etc/mkinitcpio.conf
-fi
-
-mkinitcpio -P
-
-pacman -S --noconfirm $KERNEL_PKG base linux-firmware sudo vim
-
-# Install extra packages if any
-if [[ ${#EXTRA_PKGS[@]} -gt 0 ]]; then
-    pacman -S --noconfirm ${EXTRA_PKGS[@]}
-fi
-
-# Bootloader installation
-if [[ "$BOOTLOADER" == "grub" ]]; then
-    pacman -S --noconfirm grub
-    if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        pacman -S --noconfirm efibootmgr
-        mkdir -p /boot/EFI
-        grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
-    else
-        grub-install --target=i386-pc "$DISK"
+    if [[ -n "$SWAP_PART" ]]; then
+        info "Setting up swap"
+        mkswap "$SWAP_PART"
+        swapon "$SWAP_PART"
     fi
-    grub-mkconfig -o /boot/grub/grub.cfg
-elif [[ "$BOOTLOADER" == "systemd-boot" ]]; then
-    bootctl install
-    cat <<SYSTEMD_BOOT_CONF > /boot/loader/loader.conf
-default arch
-timeout 3
-editor 0
-SYSTEMD_BOOT_CONF
-
-    cat <<ENTRY > /boot/loader/entries/arch.conf
-title   Arch Linux
-linux   /vmlinuz-linux
-initrd  /initramfs-linux.img
-options cryptdevice=UUID=$(blkid -s UUID -o value $PART_ROOT):cryptroot root=/dev/mapper/cryptroot rw
-ENTRY
-fi
-
-# Desktop Environment installation
-case $DESKTOP_ENV in
-    i3)
-        pacman -S --noconfirm xorg-server xorg-apps xorg-xinit i3
-        ;;
-    gnome)
-        pacman -S --noconfirm gnome gnome-extra gdm
-        systemctl enable gdm
-        ;;
-    kde)
-        pacman -S --noconfirm plasma kde-applications sddm
-        systemctl enable sddm
-        ;;
-    xfce)
-        pacman -S --noconfirm xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
-        systemctl enable lightdm
-        ;;
-    none)
-        ;;
-esac
-EOF
-
-    info "Installation complete! You can now reboot."
 }
 
-# Main script starts here
-clear
-echo -e "${GREEN}Welcome to the Awesome Arch Linux Installer!${NC}"
+install_base() {
+    info "Installing base system"
+    pacstrap /mnt base linux linux-firmware vim networkmanager grub
+}
 
-detect_boot_mode
-ask_swap_before_partition
-partition_menu
-select_filesystem
-swap_menu
-encryption_menu
-network_menu
-kernel_menu
-bootloader_menu
-desktop_menu
-extra_packages_menu
-locale_timezone_menu
-create_user
-install_base_system
+generate_fstab() {
+    genfstab -U /mnt >> /mnt/etc/fstab
+    success "fstab generated"
+}
+
+post_install_message() {
+    echo -e "${GREEN}
+Base installation complete!
+You can now chroot into /mnt and continue configuration:
+
+    arch-chroot /mnt
+    ln -sf /usr/share/zoneinfo/Region/City /etc/localtime
+    hwclock --systohc
+    echo yourhostname > /etc/hostname
+    passwd
+    useradd -m -G wheel -s /bin/bash youruser
+    passwd youruser
+    EDITOR=nano visudo  # Uncomment wheel line
+    systemctl enable NetworkManager
+    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB  # or BIOS
+    grub-mkconfig -o /boot/grub/grub.cfg
+
+Then reboot and enjoy Arch Linux! 🎉
+${RESET}"
+}
+
+### Main
+main() {
+    welcome
+    detect_boot_mode
+    select_disk
+    ask_swap
+    ask_filesystem
+    partition_disk
+    format_and_mount
+    install_base
+    generate_fstab
+    post_install_message
+}
+
+main "$@"
