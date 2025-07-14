@@ -22,19 +22,17 @@ echo "Boot mode detected: $BOOT_MODE"
 read -rp "Use automatic partitioning? [y/N]: " AUTO_PART
 
 if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
-    echo "Wiping $DISK..."
+    echo "Wiping and partitioning $DISK..."
     wipefs -af "$DISK"
+    sgdisk -Z "$DISK"  # Zap GPT and MBR
+    parted -s "$DISK" mklabel gpt  # ← Add this line to create a new GPT
 
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        echo "Creating GPT partition table for UEFI..."
-        parted -s "$DISK" mklabel gpt
         sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI System
         sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
     else
-        echo "Creating GPT partition table for BIOS..."
-        parted -s "$DISK" mklabel gpt
         sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot
         sgdisk -n 2:0:+512M -t 2:8300 "$DISK"  # optional /boot
         sgdisk -n 3:0:0     -t 3:8300 "$DISK"  # root
@@ -42,6 +40,7 @@ if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
         BOOT_PART="${DISK}2"
         ROOT_PART="${DISK}3"
     fi
+
 else
     echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
     read -rp "Enter root partition (e.g., /dev/sda2): " ROOT_PART
