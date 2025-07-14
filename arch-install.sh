@@ -70,6 +70,30 @@ select_disk() {
     done
 }
 
+
+ask_swap_before_partition() {
+    echo "Do you want to create a swap partition? (y/N)"
+    read -r swap_answer
+    if [[ "$swap_answer" =~ ^[Yy]$ ]]; then
+        while true; do
+            read -rp "Enter swap size in MiB (default 2048): " swap_size
+            swap_size=${swap_size:-2048}
+            if [[ "$swap_size" =~ ^[0-9]+$ ]] && (( swap_size > 0 )); then
+                SWAP_SIZE_MB=$swap_size
+                SWAP_PART_CREATE=true
+                break
+            else
+                echo "Please enter a valid positive integer."
+            fi
+        done
+    else
+        SWAP_PART_CREATE=false
+        SWAP_SIZE_MB=0
+    fi
+}
+
+
+
 # Partitioning menu
 partition_menu() {
     echo "Partitioning methods:"
@@ -88,31 +112,68 @@ partition_menu() {
 # Automatic partitioning function (simple GPT scheme)
 auto_partition() {
     info "Wiping disk $DISK and creating partitions..."
-    # Wipe disk
     wipefs -a "$DISK"
     sgdisk --zap-all "$DISK"
 
-    # Create partitions based on boot mode
+    disk_sectors=$(blockdev --getsz "$DISK")
+    sector_size=512
+    if $SWAP_PART_CREATE; then
+        swap_sectors=$((SWAP_SIZE_MB * 1024 * 1024 / sector_size))
+    fi
+
     if [[ $BOOT_MODE == "UEFI" ]]; then
         # Partition 1: EFI System Partition 512M
         sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI System Partition" "$DISK"
-        # Partition 2: Linux root, rest of disk
-        sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
+
+        if $SWAP_PART_CREATE; then
+            root_end=$((disk_sectors - swap_sectors - 2048))  # leave buffer
+            sgdisk -n 2:0:${root_end}s -t 2:8300 -c 2:"Linux root" "$DISK"
+        else
+            sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
+        fi
+
         PART_BOOT="${DISK}1"
         PART_ROOT="${DISK}2"
+
     else
-        # BIOS MBR scheme:
-        # Partition 1: BIOS boot partition 1M (if using GRUB with BIOS boot)
+        # Partition 1: BIOS boot partition 1M
         sgdisk -n 1:0:+1M -t 1:ef02 -c 1:"BIOS boot partition" "$DISK"
-        # Partition 2: Linux root (rest of disk)
-        sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
+
+        if $SWAP_PART_CREATE; then
+            root_end=$((disk_sectors - swap_sectors - 2048))
+            sgdisk -n 2:0:${root_end}s -t 2:8300 -c 2:"Linux root" "$DISK"
+        else
+            sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
+        fi
+
         PART_BIOS="${DISK}1"
         PART_ROOT="${DISK}2"
+    fi
+
+    if $SWAP_PART_CREATE; then
+        info "Creating swap partition of ${SWAP_SIZE_MB}MiB at end of disk"
+
+        last_part_end=$(parted "$DISK" unit s print | grep '^ ' | tail -n1 | awk '{print $3}' | sed 's/s//')
+        [[ -z $last_part_end ]] && last_part_end=2048
+
+        swap_start=$((last_part_end + 1))
+        swap_end=$((swap_start + swap_sectors - 1))
+
+        if (( swap_end > disk_sectors )); then
+            error "Not enough space to create swap partition of ${SWAP_SIZE_MB}MiB."
+            exit 1
+        fi
+
+        sgdisk -n 0:${swap_start}s:${swap_end}s -t 0:8200 -c 0:"Swap Partition" "$DISK"
+        partprobe "$DISK"
+
+        SWAP_PART=$(lsblk -ln -o NAME,PARTTYPE "$DISK" | grep "8200" | awk '{print "/dev/" $1}' | tail -n1)
     fi
 
     echo "Partitions created:"
     lsblk "$DISK"
 }
+
 
 manual_partition() {
     info "Launching cfdisk for manual partitioning..."
@@ -593,7 +654,7 @@ clear
 echo -e "${GREEN}Welcome to the Awesome Arch Linux Installer!${NC}"
 
 detect_boot_mode
-select_disk
+ask_swap_before_partition
 partition_menu
 select_filesystem
 swap_menu
