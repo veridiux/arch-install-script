@@ -21,7 +21,6 @@ echo "Boot mode detected: $BOOT_MODE"
 # === 3. Partitioning ===
 read -rp "Use automatic partitioning? [y/N]: " AUTO_PART
 
-# Initialize variables to avoid unbound errors
 EFI_PART=""
 BIOS_BOOT_PART=""
 ROOT_PART=""
@@ -98,18 +97,25 @@ read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TO
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
-# Overwrite fstab
+# Overwrite fstab (don't append)
 genfstab -U /mnt > /mnt/etc/fstab
 
 # === 13. Chroot Configuration ===
 arch-chroot /mnt /bin/bash <<EOF
 set -euo pipefail
 
-# Mount virtual filesystems needed for grub-install
+# Mount virtual filesystems for grub & chroot commands
 mount -t proc /proc /proc
 mount --rbind /sys /sys
 mount --rbind /dev /dev
 
+# Mount EFI partition inside chroot for UEFI
+if [[ "$BOOT_MODE" == "UEFI" ]]; then
+    mkdir -p /boot
+    mountpoint -q /boot || mount "$EFI_PART" /boot
+fi
+
+# Timezone & locale
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
 
@@ -122,14 +128,14 @@ echo "LANG=en_US.UTF-8" > /etc/locale.conf
 useradd -m "$USERNAME"
 echo "$USERNAME:$PASSWORD" | chpasswd
 
-# Sudo
+# Sudo setup
 if [[ "$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm sudo
     usermod -aG wheel "$USERNAME"
     sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 fi
 
-# Desktop Environment
+# Desktop Environment install and enable services (without systemctl --now)
 case "$DE" in
     GNOME)
         pacman -S --noconfirm gnome gdm
@@ -158,50 +164,42 @@ fi
 # VMware Tools
 if [[ "$INSTALL_VMWARE_TOOLS" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm open-vm-tools
-    systemctl enable --now vmtoolsd
+    systemctl enable vmtoolsd
 fi
 
-# Detect and install video drivers
+# Video drivers detection
 if lspci | grep -iq 'Intel Corporation'; then
-    echo "Detected Intel graphics, installing drivers..."
     pacman -S --noconfirm xf86-video-intel
 fi
 
 if lspci | grep -iq 'NVIDIA'; then
-    echo "Detected NVIDIA graphics, installing drivers..."
     pacman -S --noconfirm nvidia nvidia-utils
 fi
 
 if lspci | grep -iq 'AMD/ATI'; then
-    echo "Detected AMD graphics, installing drivers..."
     pacman -S --noconfirm xf86-video-amdgpu
-fi
-
-# Mount EFI partition for grub (UEFI)
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    mkdir -p /boot
-    mountpoint -q /boot || mount "$EFI_PART" /boot
 fi
 
 # Install and configure GRUB bootloader
 pacman -S --noconfirm grub efibootmgr os-prober
 
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
+    echo "Installing GRUB for UEFI..."
+    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable || { echo "grub-install failed"; exit 1; }
 else
-    # BIOS mode: check for BIOS boot partition on GPT
     BIOS_PART_EXISTS=\$(parted "$DISK" print | grep -i bios_grub || true)
     if [[ -z "\$BIOS_PART_EXISTS" ]]; then
         echo "WARNING: No BIOS boot partition found on $DISK."
-        echo "Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun the installer."
+        echo "Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun."
         exit 1
     fi
-    grub-install --target=i386-pc "$DISK"
+    echo "Installing GRUB for BIOS..."
+    grub-install --target=i386-pc "$DISK" || { echo "grub-install failed"; exit 1; }
 fi
 
-grub-mkconfig -o /boot/grub/grub.cfg
+grub-mkconfig -o /boot/grub/grub.cfg || { echo "grub-mkconfig failed"; exit 1; }
 
-# Unmount virtual filesystems before exit
+# Unmount virtual filesystems
 umount -R /proc /sys /dev || true
 
 EOF
