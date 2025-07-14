@@ -25,21 +25,18 @@ if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
     echo "Wiping and partitioning $DISK..."
     wipefs -af "$DISK"
     sgdisk -Z "$DISK"
-    parted -s "$DISK" mklabel gpt
 
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI System Partition
-        sgdisk -n 2:0:0 -t 2:8300 "$DISK"      # root partition
+        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI System
+        sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
     else
-        # BIOS + GPT requires BIOS boot partition + /boot + root
-        sgdisk -n 1:0:+1M -t 1:ef02 "$DISK"    # BIOS boot partition
-        sgdisk -n 2:0:+512M -t 2:8300 "$DISK"  # /boot partition (ext4)
-        sgdisk -n 3:0:0 -t 3:8300 "$DISK"      # root partition
+        # For BIOS + GPT, BIOS boot partition required
+        sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot partition
+        sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
+        ROOT_PART="${DISK}2"
         BIOS_BOOT_PART="${DISK}1"
-        BOOT_PART="${DISK}2"
-        ROOT_PART="${DISK}3"
     fi
 else
     echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
@@ -47,8 +44,7 @@ else
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
         read -rp "Enter EFI partition (e.g., /dev/sda1): " EFI_PART
     else
-        read -rp "Enter /boot partition (e.g., /dev/sda1): " BOOT_PART
-        BIOS_BOOT_PART=""  # Assume user made BIOS boot partition if needed
+        BIOS_BOOT_PART=""
     fi
 fi
 
@@ -57,19 +53,12 @@ echo "Choose filesystem for root partition:"
 select FILESYSTEM in ext4 btrfs xfs; do
     [[ -n "$FILESYSTEM" ]] && break
 done
-
-echo "Formatting partitions..."
+echo "Formatting $ROOT_PART as $FILESYSTEM..."
+mkfs."$FILESYSTEM" "$ROOT_PART"
 
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    echo "Formatting EFI partition ($EFI_PART) as FAT32..."
+    echo "Formatting $EFI_PART as FAT32..."
     mkfs.fat -F32 "$EFI_PART"
-    echo "Formatting root partition ($ROOT_PART) as $FILESYSTEM..."
-    mkfs."$FILESYSTEM" "$ROOT_PART"
-else
-    echo "Formatting /boot partition ($BOOT_PART) as ext4..."
-    mkfs.ext4 "$BOOT_PART"
-    echo "Formatting root partition ($ROOT_PART) as $FILESYSTEM..."
-    mkfs."$FILESYSTEM" "$ROOT_PART"
 fi
 
 # === 5. Mount Partitions ===
@@ -77,9 +66,6 @@ mount "$ROOT_PART" /mnt
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     mkdir -p /mnt/boot
     mount "$EFI_PART" /mnt/boot
-else
-    mkdir -p /mnt/boot
-    mount "$BOOT_PART" /mnt/boot
 fi
 
 # === 6. Hostname ===
@@ -109,7 +95,7 @@ read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TO
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
-genfstab -U /mnt > /mnt/etc/fstab
+genfstab -U /mnt >> /mnt/etc/fstab
 
 # === 13. Chroot Configuration ===
 arch-chroot /mnt /bin/bash <<EOF
@@ -185,26 +171,37 @@ fi
 # Bootloader install
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     pacman -S --noconfirm grub efibootmgr
+    mountpoint -q /boot || mount "$EFI_PART" /boot
     grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
 else
     pacman -S --noconfirm grub
-    # BIOS + GPT: check BIOS boot partition presence (skip if user partitioned manually)
-    if [[ -n "$BIOS_BOOT_PART" ]]; then
-        # no need to mount BIOS boot partition
-        grub-install --target=i386-pc --recheck "$DISK"
-    else
-        echo "WARNING: BIOS boot partition not set; grub install might fail!"
-        grub-install --target=i386-pc --recheck "$DISK" || echo "grub-install failed!"
+    # Check BIOS boot partition for GPT
+    BIOS_BOOT_PART="\$(parted $DISK print | grep bios_grub | awk '{print \$1}')"
+    if [[ -z "\$BIOS_BOOT_PART" ]]; then
+        echo "WARNING: No BIOS boot partition found on $DISK."
+        echo "Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun the installer."
+        exit 1
     fi
+    grub-install --target=i386-pc "$DISK"
+fi
+
+# Ensure grub config directory exists
+if [[ ! -d /boot/grub ]]; then
+    mkdir -p /boot/grub
 fi
 
 grub-mkconfig -o /boot/grub/grub.cfg
 
+if [[ -f /boot/grub/grub.cfg ]]; then
+    echo "GRUB config generated successfully."
+else
+    echo "Failed to generate GRUB config!"
+    exit 1
+fi
+
 EOF
 
 # === 14. Cleanup ===
-umount -R /mnt
-
-# === 15. Done ===
 echo "Installation complete!"
-echo "You can now reboot."
+echo "You can chroot to your system with: arch-chroot /mnt"
+echo "Remember to unmount partitions and reboot."
