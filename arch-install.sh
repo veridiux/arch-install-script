@@ -24,33 +24,16 @@ read -rp "Use automatic partitioning? [y/N]: " AUTO_PART
 if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
     echo "Wiping and partitioning $DISK..."
     wipefs -af "$DISK"
+    sgdisk -Z "$DISK"
 
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        parted "$DISK" --script mklabel gpt
-        parted "$DISK" --script mkpart ESP fat32 1MiB 513MiB
-        parted "$DISK" --script set 1 esp on
-        parted "$DISK" --script mkpart primary 513MiB 100%
+        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI
+        sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
-
     else
-        echo "BIOS boot detected. Choose partition table type:"
-        select TABLE_TYPE in GPT MBR; do
-            [[ -n "$TABLE_TYPE" ]] && break
-        done
-
-        if [[ "$TABLE_TYPE" == "GPT" ]]; then
-            parted "$DISK" --script mklabel gpt
-            parted "$DISK" --script mkpart biosboot 1MiB 3MiB
-            parted "$DISK" --script set 1 bios_grub on
-            parted "$DISK" --script mkpart primary 3MiB 100%
-            ROOT_PART="${DISK}2"
-        else
-            parted "$DISK" --script mklabel msdos
-            parted "$DISK" --script mkpart primary ext4 1MiB 100%
-            parted "$DISK" --script set 1 boot on
-            ROOT_PART="${DISK}1"
-        fi
+        sgdisk -n 1:0:0 -t 1:8300 "$DISK"
+        ROOT_PART="${DISK}1"
     fi
 else
     echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
@@ -100,14 +83,19 @@ read -rp "Install sudo and allow wheel group? [y/N]: " INSTALL_SUDO
 # === 10. Networking ===
 read -rp "Install NetworkManager? [y/N]: " INSTALL_NET
 
-# === 11. Base Install ===
+# === 11. VMware Tools ===
+read -rp "Running inside VMware? Install open-vm-tools? [y/N]: " INSTALL_VMWARE_TOOLS
+
+# === 12. Base Install ===
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
-genfstab -U /mnt >> /mnt/etc/fstab
+# Prepare chroot commands
+cat <<EOF > /mnt/root/arch-setup-chroot.sh
+#!/bin/bash
+set -euo pipefail
 
-# === 12. Chroot Configuration ===
-arch-chroot /mnt /bin/bash <<EOF
+# Timezone and locale
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
 
@@ -116,19 +104,19 @@ echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
-# User creation
+# User setup
 useradd -m "$USERNAME"
 echo "$USERNAME:$PASSWORD" | chpasswd
 
-# Sudo
-if [[ "$INSTALL_SUDO" == "y" || "$INSTALL_SUDO" == "Y" ]]; then
+# Sudo setup
+if [[ "$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm sudo
     usermod -aG wheel "$USERNAME"
     sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 fi
 
 # Desktop Environment
-case $DE in
+case "$DE" in
     GNOME)
         pacman -S --noconfirm gnome gdm
         systemctl enable gdm
@@ -148,23 +136,53 @@ case $DE in
 esac
 
 # Networking
-if [[ "$INSTALL_NET" == "y" || "$INSTALL_NET" == "Y" ]]; then
+if [[ "$INSTALL_NET" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm networkmanager
     systemctl enable NetworkManager
 fi
 
-# Bootloader
+# VMware tools
+if [[ "$INSTALL_VMWARE_TOOLS" =~ ^[Yy]$ ]]; then
+    pacman -S --noconfirm open-vm-tools xf86-video-vmware
+    systemctl enable --now vmtoolsd
+fi
+
+# Detect and install video drivers
+if lspci | grep -i 'Intel Corporation' &> /dev/null; then
+    echo "Detected Intel graphics, installing drivers..."
+    pacman -S --noconfirm xf86-video-intel
+fi
+
+if lspci | grep -i 'NVIDIA' &> /dev/null; then
+    echo "Detected NVIDIA graphics, installing drivers..."
+    pacman -S --noconfirm nvidia nvidia-utils
+fi
+
+# Bootloader install
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     pacman -S --noconfirm grub efibootmgr
     grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 else
-    pacman -S --noconfirm grub
-    grub-install --target=i386-pc "$DISK"
+    # Check for BIOS boot partition for grub-install
+    if parted $DISK print | grep -q 'bios_grub'; then
+        pacman -S --noconfirm grub
+        grub-install --target=i386-pc "$DISK"
+    else
+        echo "No BIOS boot partition found. Installing GRUB with --force (not recommended)..."
+        pacman -S --noconfirm grub
+        grub-install --target=i386-pc --force "$DISK"
+    fi
 fi
 
 grub-mkconfig -o /boot/grub/grub.cfg
+
 EOF
 
-# === 13. Done ===
+chmod +x /mnt/root/arch-setup-chroot.sh
+
+# === 13. Chroot and run configuration script ===
+arch-chroot /mnt /root/arch-setup-chroot.sh
+
+# === 14. Done ===
 echo "Installation complete!"
 echo "You can chroot to your system with: arch-chroot /mnt"
