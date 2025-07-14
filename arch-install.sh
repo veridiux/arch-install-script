@@ -21,7 +21,7 @@ echo "Boot mode detected: $BOOT_MODE"
 # === 3. Partitioning ===
 read -rp "Use automatic partitioning? [y/N]: " AUTO_PART
 
-# Initialize EFI_PART and BIOS_BOOT_PART to empty to avoid unbound errors
+# Initialize variables to avoid unbound errors
 EFI_PART=""
 BIOS_BOOT_PART=""
 ROOT_PART=""
@@ -98,43 +98,39 @@ read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TO
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
-# Overwrite fstab (don't append)
+# Overwrite fstab
 genfstab -U /mnt > /mnt/etc/fstab
 
 # === 13. Chroot Configuration ===
-arch-chroot /mnt /bin/bash -euo pipefail <<EOF
-EFI_PART="$EFI_PART"
-DISK="$DISK"
-BOOT_MODE="$BOOT_MODE"
-HOSTNAME="$HOSTNAME"
-USERNAME="$USERNAME"
-PASSWORD="$PASSWORD"
-INSTALL_SUDO="$INSTALL_SUDO"
-DE="$DE"
-INSTALL_NET="$INSTALL_NET"
-INSTALL_VMWARE_TOOLS="$INSTALL_VMWARE_TOOLS"
+arch-chroot /mnt /bin/bash <<EOF
+set -euo pipefail
+
+# Mount virtual filesystems needed for grub-install
+mount -t proc /proc /proc
+mount --rbind /sys /sys
+mount --rbind /dev /dev
 
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
 
-echo "\$HOSTNAME" > /etc/hostname
+echo "$HOSTNAME" > /etc/hostname
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
 # User creation
-useradd -m "\$USERNAME"
-echo "\$USERNAME:\$PASSWORD" | chpasswd
+useradd -m "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
 
 # Sudo
-if [[ "\$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
+if [[ "$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm sudo
-    usermod -aG wheel "\$USERNAME"
+    usermod -aG wheel "$USERNAME"
     sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 fi
 
 # Desktop Environment
-case "\$DE" in
+case "$DE" in
     GNOME)
         pacman -S --noconfirm gnome gdm
         systemctl enable gdm
@@ -154,15 +150,15 @@ case "\$DE" in
 esac
 
 # Networking
-if [[ "\$INSTALL_NET" =~ ^[Yy]$ ]]; then
+if [[ "$INSTALL_NET" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm networkmanager
     systemctl enable NetworkManager
 fi
 
-# VMware Tools (remove --now)
-if [[ "\$INSTALL_VMWARE_TOOLS" =~ ^[Yy]$ ]]; then
+# VMware Tools
+if [[ "$INSTALL_VMWARE_TOOLS" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm open-vm-tools
-    systemctl enable vmtoolsd
+    systemctl enable --now vmtoolsd
 fi
 
 # Detect and install video drivers
@@ -182,52 +178,38 @@ if lspci | grep -iq 'AMD/ATI'; then
 fi
 
 # Mount EFI partition for grub (UEFI)
-if [[ "\$BOOT_MODE" == "UEFI" ]]; then
+if [[ "$BOOT_MODE" == "UEFI" ]]; then
     mkdir -p /boot
-    mountpoint -q /boot || mount "\$EFI_PART" /boot
+    mountpoint -q /boot || mount "$EFI_PART" /boot
 fi
 
 # Install and configure GRUB bootloader
 pacman -S --noconfirm grub efibootmgr os-prober
 
-if [[ "\$BOOT_MODE" == "UEFI" ]]; then
+if [[ "$BOOT_MODE" == "UEFI" ]]; then
     grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
-    if [[ \$? -ne 0 ]]; then
-        echo "Error: grub-install failed for UEFI."
-        exit 1
-    fi
 else
-    BIOS_PART_EXISTS=\$(parted "\$DISK" print | grep -i bios_grub || true)
+    # BIOS mode: check for BIOS boot partition on GPT
+    BIOS_PART_EXISTS=\$(parted "$DISK" print | grep -i bios_grub || true)
     if [[ -z "\$BIOS_PART_EXISTS" ]]; then
-        echo "WARNING: No BIOS boot partition found on \$DISK. Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun the installer."
+        echo "WARNING: No BIOS boot partition found on $DISK."
+        echo "Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun the installer."
         exit 1
     fi
-    grub-install --target=i386-pc "\$DISK"
-    if [[ \$? -ne 0 ]]; then
-        echo "Error: grub-install failed for BIOS."
-        exit 1
-    fi
+    grub-install --target=i386-pc "$DISK"
 fi
 
 grub-mkconfig -o /boot/grub/grub.cfg
 
-if [[ ! -f /boot/grub/grub.cfg ]]; then
-    echo "Error: grub.cfg was not generated."
-    exit 1
-fi
+# Unmount virtual filesystems before exit
+umount -R /proc /sys /dev || true
 
 EOF
 
-# === 14. Verify grub.cfg before cleanup ===
-if [[ ! -f /mnt/boot/grub/grub.cfg ]]; then
-    echo "Error: grub.cfg not found on /mnt/boot/grub/. Please check installation."
-    exit 1
-fi
-
-# === 15. Cleanup ===
+# === 14. Cleanup ===
 echo "Unmounting partitions..."
 umount -R /mnt
 
-# === 16. Done ===
+# === 15. Done ===
 echo "Installation complete!"
 echo "You can now reboot and boot into your new Arch Linux system."
