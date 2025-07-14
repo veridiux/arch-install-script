@@ -58,9 +58,12 @@ fi
 
 # === 5. Mount Partitions ===
 mount "$ROOT_PART" /mnt
+
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
+    mkdir -p /mnt/boot/efi
+    mount "$EFI_PART" /mnt/boot/efi
+else
     mkdir -p /mnt/boot
-    mount "$EFI_PART" /mnt/boot
 fi
 
 # === 6. Hostname ===
@@ -91,27 +94,39 @@ genfstab -U /mnt >> /mnt/etc/fstab
 
 # === 12. Chroot Configuration ===
 arch-chroot /mnt /bin/bash <<EOF
+set -e
+
+export DISK="$DISK"
+export BOOT_MODE="$BOOT_MODE"
+export EFI_PART="${EFI_PART:-}"
+export USERNAME="$USERNAME"
+export PASSWORD="$PASSWORD"
+export HOSTNAME="$HOSTNAME"
+export INSTALL_SUDO="$INSTALL_SUDO"
+export INSTALL_NET="$INSTALL_NET"
+export DE="$DE"
+
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
 
-echo "$HOSTNAME" > /etc/hostname
+echo "\$HOSTNAME" > /etc/hostname
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
 # User creation
-useradd -m "$USERNAME"
-echo "$USERNAME:$PASSWORD" | chpasswd
+useradd -m "\$USERNAME"
+echo "\$USERNAME:\$PASSWORD" | chpasswd
 
-# Sudo
-if [[ "$INSTALL_SUDO" == "y" || "$INSTALL_SUDO" == "Y" ]]; then
+# Sudo setup
+if [[ "\$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm sudo
-    usermod -aG wheel "$USERNAME"
+    usermod -aG wheel "\$USERNAME"
     sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 fi
 
-# Desktop Environment
-case $DE in
+# Desktop Environment install & enable display manager
+case \$DE in
     GNOME)
         pacman -S --noconfirm gnome gdm
         systemctl enable gdm
@@ -130,18 +145,21 @@ case $DE in
         ;;
 esac
 
-# Networking
-if [[ "$INSTALL_NET" == "y" || "$INSTALL_NET" == "Y" ]]; then
+# Networking setup
+if [[ "\$INSTALL_NET" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm networkmanager
     systemctl enable NetworkManager
 fi
 
-# Bootloader
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
+# Bootloader install
+if [[ "\$BOOT_MODE" == "UEFI" ]]; then
     pacman -S --noconfirm grub efibootmgr
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+    mkdir -p /boot/efi
+    mount "\$EFI_PART" /boot/efi
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable
 else
-    grub-install --target=i386-pc "$DISK"
+    pacman -S --noconfirm grub
+    grub-install --target=i386-pc "\$DISK"
 fi
 
 grub-mkconfig -o /boot/grub/grub.cfg
