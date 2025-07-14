@@ -158,6 +158,12 @@ if lspci | grep -i 'NVIDIA' &> /dev/null; then
     pacman -S --noconfirm nvidia nvidia-utils
 fi
 
+if lspci | grep -i 'AMD/ATI' &> /dev/null; then
+    echo "Detected AMD graphics, installing drivers..."
+    pacman -S --noconfirm xf86-video-amdgpu
+fi
+
+
 # Bootloader install
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     pacman -S --noconfirm grub efibootmgr
