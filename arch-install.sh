@@ -18,6 +18,11 @@ else
 fi
 echo "Boot mode detected: $BOOT_MODE"
 
+# Initialize variables so they are always defined
+EFI_PART=""
+BIOS_BOOT_PART=""
+ROOT_PART=""
+
 # === 3. Partitioning ===
 read -rp "Use automatic partitioning? [y/N]: " AUTO_PART
 
@@ -32,11 +37,10 @@ if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
     else
-        # For BIOS + GPT, BIOS boot partition required
-        sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot partition
+        sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot partition (needed for grub on GPT BIOS)
         sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
-        ROOT_PART="${DISK}2"
         BIOS_BOOT_PART="${DISK}1"
+        ROOT_PART="${DISK}2"
         EFI_PART=""
     fi
 else
@@ -99,17 +103,14 @@ pacstrap /mnt base linux linux-firmware vim grub os-prober
 
 genfstab -U /mnt >> /mnt/etc/fstab
 
-# Export variables for chroot usage
-export EFI_PART ROOT_PART DISK BOOT_MODE USERNAME PASSWORD INSTALL_SUDO INSTALL_NET INSTALL_VMWARE_TOOLS DE
-
 # === 13. Chroot Configuration ===
-arch-chroot /mnt /bin/bash -e <<EOF
+arch-chroot /mnt /bin/bash <<EOF
 set -e
 
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
 
-echo "$HOSTNAME" > /etc/hostname"
+echo "$HOSTNAME" > /etc/hostname
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
@@ -176,8 +177,8 @@ fi
 # Bootloader install
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     pacman -S --noconfirm grub efibootmgr
-    if ! mountpoint -q /boot; then
-        mount "$EFI_PART" /boot
+    if ! mountpoint -q /boot && [[ -n "${EFI_PART:-}" ]]; then
+        mount "${EFI_PART}" /boot
     fi
     grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
 else
@@ -189,7 +190,9 @@ grub-mkconfig -o /boot/grub/grub.cfg
 
 EOF
 
-# === 14. Done ===
+# === 14. Cleanup ===
+umount -R /mnt
+
+# === 15. Done ===
 echo "Installation complete!"
-echo "You can chroot to your system with: arch-chroot /mnt"
-echo "Remember to unmount partitions and reboot."
+echo "You can now reboot."
