@@ -185,32 +185,38 @@ select_swap_partition() {
 create_swap_partition() {
     info "Creating a swap partition automatically..."
 
-    # Wipe existing partitions table for safety (optional, but here we keep existing except we add swap partition at end)
-    # We'll create a 2G swap partition at the end of disk
+    # Disk total sectors
+    local disk_sectors
+    disk_sectors=$(blockdev --getsz "$DISK")
 
-    # Get disk size in sectors
-    SECTORS=$(blockdev --getsz "$DISK")
+    # Swap size in MiB
+    local swap_size_mb=2048
+    local sector_size=512
+    local swap_sectors=$((swap_size_mb * 1024 * 1024 / sector_size))
 
-    # Define swap size in MiB
-    SWAP_SIZE_MB=2048
-    SECTOR_SIZE=512
-    SWAP_SECTORS=$((SWAP_SIZE_MB * 1024 * 1024 / SECTOR_SIZE))
+    # Find last partition end sector
+    # If no partitions, start after 2048 sectors (1 MiB aligned)
+    local last_part_end
+    last_part_end=$(parted "$DISK" unit s print | grep '^ ' | tail -n1 | awk '{print $3}' | sed 's/s//')
 
-    # Calculate start sector for swap partition (last sectors)
-    # Get last partition end sector
-    LAST_PART_END=$(sgdisk -E "$DISK")
-    SWAP_START=$((LAST_PART_END - SWAP_SECTORS + 1))
+    if [[ -z $last_part_end ]]; then
+        last_part_end=2048
+    fi
 
-    if (( SWAP_START <= 2048 )); then
-        error "Disk too small to create swap partition automatically."
+    local swap_start=$((last_part_end + 1))
+    local swap_end=$((swap_start + swap_sectors - 1))
+
+    # Check if swap_end fits on disk
+    if (( swap_end > disk_sectors )); then
+        error "Not enough space at the end of $DISK to create a ${swap_size_mb}MiB swap partition."
         return 1
     fi
 
-    # Create swap partition at end
-    sgdisk -n 0:$SWAP_START:0 -t 0:8200 -c 0:"Swap Partition" "$DISK"
+    # Create swap partition
+    sgdisk -n 0:${swap_start}s:${swap_end}s -t 0:8200 -c 0:"Swap Partition" "$DISK"
     partprobe "$DISK"
 
-    # Find new swap partition
+    # Find new swap partition (latest with type 8200)
     SWAP_PART=$(lsblk -ln -o NAME,PARTTYPE "$DISK" | grep "8200" | awk '{print "/dev/" $1}' | tail -n1)
 
     if [[ -z $SWAP_PART ]]; then
@@ -223,6 +229,7 @@ create_swap_partition() {
 
     echo "Swap partition $SWAP_PART created and formatted."
 }
+
 
 # In the install_base_system function, update the swap setup case:
 
