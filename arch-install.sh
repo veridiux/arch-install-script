@@ -32,11 +32,12 @@ if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
     else
-        # BIOS + GPT requires BIOS boot partition
+        # For BIOS + GPT, BIOS boot partition required
         sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot partition
         sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
-        BIOS_BOOT_PART="${DISK}1"
         ROOT_PART="${DISK}2"
+        BIOS_BOOT_PART="${DISK}1"
+        EFI_PART=""
     fi
 else
     echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
@@ -44,6 +45,7 @@ else
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
         read -rp "Enter EFI partition (e.g., /dev/sda1): " EFI_PART
     else
+        EFI_PART=""
         BIOS_BOOT_PART=""
     fi
 fi
@@ -95,16 +97,19 @@ read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TO
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
-genfstab -U /mnt > /mnt/etc/fstab
+genfstab -U /mnt >> /mnt/etc/fstab
+
+# Export variables for chroot usage
+export EFI_PART ROOT_PART DISK BOOT_MODE USERNAME PASSWORD INSTALL_SUDO INSTALL_NET INSTALL_VMWARE_TOOLS DE
 
 # === 13. Chroot Configuration ===
-arch-chroot /mnt /bin/bash <<EOF
+arch-chroot /mnt /bin/bash -e <<EOF
 set -e
 
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
 
-echo "$HOSTNAME" > /etc/hostname
+echo "$HOSTNAME" > /etc/hostname"
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
@@ -174,45 +179,17 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     if ! mountpoint -q /boot; then
         mount "$EFI_PART" /boot
     fi
-    echo "EFI partition mounted at /boot:"
-    mount | grep 'on /boot '
-    echo "Installing GRUB for UEFI..."
     grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
-
 else
     pacman -S --noconfirm grub
-    BIOS_BOOT_PART="\$(parted $DISK print | grep bios_grub | awk '{print \$1}')"
-    if [[ -z "\$BIOS_BOOT_PART" ]]; then
-        echo "WARNING: No BIOS boot partition found on $DISK."
-        echo "Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun the installer."
-        exit 1
-    fi
-    echo "Installing GRUB for BIOS..."
     grub-install --target=i386-pc "$DISK"
 fi
 
-# Ensure /boot/grub directory exists
-if [[ ! -d /boot/grub ]]; then
-    echo "/boot/grub directory missing, creating it."
-    mkdir -p /boot/grub
-fi
-
-echo "Generating grub config file at /boot/grub/grub.cfg ..."
 grub-mkconfig -o /boot/grub/grub.cfg
 
-if [[ -f /boot/grub/grub.cfg ]]; then
-    echo "GRUB config generated successfully."
-else
-    echo "ERROR: Failed to generate GRUB config!"
-    ls -l /boot/grub/
-    exit 1
-fi
 EOF
 
-# === 14. Cleanup ===
-echo "Unmounting partitions..."
-umount -R /mnt
-
-# === 15. Done ===
+# === 14. Done ===
 echo "Installation complete!"
-echo "You can now reboot your system."
+echo "You can chroot to your system with: arch-chroot /mnt"
+echo "Remember to unmount partitions and reboot."
