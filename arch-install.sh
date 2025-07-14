@@ -143,9 +143,10 @@ fi
 
 # VMware tools
 if [[ "$INSTALL_VMWARE_TOOLS" =~ ^[Yy]$ ]]; then
-    pacman -S --noconfirm open-vm-tools xf86-video-vmware
+    pacman -S --noconfirm open-vm-tools
     systemctl enable --now vmtoolsd
 fi
+
 
 # Detect and install video drivers
 if lspci | grep -i 'Intel Corporation' &> /dev/null; then
