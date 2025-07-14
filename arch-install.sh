@@ -24,16 +24,33 @@ read -rp "Use automatic partitioning? [y/N]: " AUTO_PART
 if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
     echo "Wiping and partitioning $DISK..."
     wipefs -af "$DISK"
-    sgdisk -Z "$DISK"
 
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI
-        sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
+        parted "$DISK" --script mklabel gpt
+        parted "$DISK" --script mkpart ESP fat32 1MiB 513MiB
+        parted "$DISK" --script set 1 esp on
+        parted "$DISK" --script mkpart primary 513MiB 100%
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
+
     else
-        sgdisk -n 1:0:0 -t 1:8300 "$DISK"
-        ROOT_PART="${DISK}1"
+        echo "BIOS boot detected. Choose partition table type:"
+        select TABLE_TYPE in GPT MBR; do
+            [[ -n "$TABLE_TYPE" ]] && break
+        done
+
+        if [[ "$TABLE_TYPE" == "GPT" ]]; then
+            parted "$DISK" --script mklabel gpt
+            parted "$DISK" --script mkpart biosboot 1MiB 3MiB
+            parted "$DISK" --script set 1 bios_grub on
+            parted "$DISK" --script mkpart primary 3MiB 100%
+            ROOT_PART="${DISK}2"
+        else
+            parted "$DISK" --script mklabel msdos
+            parted "$DISK" --script mkpart primary ext4 1MiB 100%
+            parted "$DISK" --script set 1 boot on
+            ROOT_PART="${DISK}1"
+        fi
     fi
 else
     echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
@@ -58,12 +75,9 @@ fi
 
 # === 5. Mount Partitions ===
 mount "$ROOT_PART" /mnt
-
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    mkdir -p /mnt/boot/efi
-    mount "$EFI_PART" /mnt/boot/efi
-else
     mkdir -p /mnt/boot
+    mount "$EFI_PART" /mnt/boot
 fi
 
 # === 6. Hostname ===
@@ -94,39 +108,27 @@ genfstab -U /mnt >> /mnt/etc/fstab
 
 # === 12. Chroot Configuration ===
 arch-chroot /mnt /bin/bash <<EOF
-set -e
-
-export DISK="$DISK"
-export BOOT_MODE="$BOOT_MODE"
-export EFI_PART="${EFI_PART:-}"
-export USERNAME="$USERNAME"
-export PASSWORD="$PASSWORD"
-export HOSTNAME="$HOSTNAME"
-export INSTALL_SUDO="$INSTALL_SUDO"
-export INSTALL_NET="$INSTALL_NET"
-export DE="$DE"
-
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
 
-echo "\$HOSTNAME" > /etc/hostname
+echo "$HOSTNAME" > /etc/hostname
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
 # User creation
-useradd -m "\$USERNAME"
-echo "\$USERNAME:\$PASSWORD" | chpasswd
+useradd -m "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
 
-# Sudo setup
-if [[ "\$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
+# Sudo
+if [[ "$INSTALL_SUDO" == "y" || "$INSTALL_SUDO" == "Y" ]]; then
     pacman -S --noconfirm sudo
-    usermod -aG wheel "\$USERNAME"
+    usermod -aG wheel "$USERNAME"
     sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 fi
 
-# Desktop Environment install & enable display manager
-case \$DE in
+# Desktop Environment
+case $DE in
     GNOME)
         pacman -S --noconfirm gnome gdm
         systemctl enable gdm
@@ -145,21 +147,19 @@ case \$DE in
         ;;
 esac
 
-# Networking setup
-if [[ "\$INSTALL_NET" =~ ^[Yy]$ ]]; then
+# Networking
+if [[ "$INSTALL_NET" == "y" || "$INSTALL_NET" == "Y" ]]; then
     pacman -S --noconfirm networkmanager
     systemctl enable NetworkManager
 fi
 
-# Bootloader install
-if [[ "\$BOOT_MODE" == "UEFI" ]]; then
+# Bootloader
+if [[ "$BOOT_MODE" == "UEFI" ]]; then
     pacman -S --noconfirm grub efibootmgr
-    mkdir -p /boot/efi
-    mount "\$EFI_PART" /boot/efi
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable
+    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 else
     pacman -S --noconfirm grub
-    grub-install --target=i386-pc "\$DISK"
+    grub-install --target=i386-pc "$DISK"
 fi
 
 grub-mkconfig -o /boot/grub/grub.cfg
