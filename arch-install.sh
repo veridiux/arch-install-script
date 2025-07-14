@@ -18,13 +18,12 @@ else
 fi
 echo "Boot mode detected: $BOOT_MODE"
 
-# Initialize variables so they are always defined
-EFI_PART=""
-BIOS_BOOT_PART=""
-ROOT_PART=""
-
 # === 3. Partitioning ===
 read -rp "Use automatic partitioning? [y/N]: " AUTO_PART
+
+# Initialize EFI_PART and BIOS_BOOT_PART to empty to avoid unbound errors
+EFI_PART=""
+BIOS_BOOT_PART=""
 
 if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
     echo "Wiping and partitioning $DISK..."
@@ -37,20 +36,17 @@ if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
     else
-        sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot partition (needed for grub on GPT BIOS)
+        # BIOS + GPT requires BIOS boot partition
+        sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot partition
         sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
         BIOS_BOOT_PART="${DISK}1"
         ROOT_PART="${DISK}2"
-        EFI_PART=""
     fi
 else
     echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
     read -rp "Enter root partition (e.g., /dev/sda2): " ROOT_PART
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
         read -rp "Enter EFI partition (e.g., /dev/sda1): " EFI_PART
-    else
-        EFI_PART=""
-        BIOS_BOOT_PART=""
     fi
 fi
 
@@ -63,7 +59,7 @@ echo "Formatting $ROOT_PART as $FILESYSTEM..."
 mkfs."$FILESYSTEM" "$ROOT_PART"
 
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    echo "Formatting $EFI_PART as FAT32..."
+    echo "Formatting EFI partition $EFI_PART as FAT32..."
     mkfs.fat -F32 "$EFI_PART"
 fi
 
@@ -101,11 +97,12 @@ read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TO
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
-genfstab -U /mnt >> /mnt/etc/fstab
+# Overwrite fstab (don't append)
+genfstab -U /mnt > /mnt/etc/fstab
 
 # === 13. Chroot Configuration ===
 arch-chroot /mnt /bin/bash <<EOF
-set -e
+set -euo pipefail
 
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
@@ -127,7 +124,7 @@ if [[ "$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
 fi
 
 # Desktop Environment
-case $DE in
+case "$DE" in
     GNOME)
         pacman -S --noconfirm gnome gdm
         systemctl enable gdm
@@ -159,30 +156,39 @@ if [[ "$INSTALL_VMWARE_TOOLS" =~ ^[Yy]$ ]]; then
 fi
 
 # Detect and install video drivers
-if lspci | grep -i 'Intel Corporation' &> /dev/null; then
+if lspci | grep -iq 'Intel Corporation'; then
     echo "Detected Intel graphics, installing drivers..."
     pacman -S --noconfirm xf86-video-intel
 fi
 
-if lspci | grep -i 'NVIDIA' &> /dev/null; then
+if lspci | grep -iq 'NVIDIA'; then
     echo "Detected NVIDIA graphics, installing drivers..."
     pacman -S --noconfirm nvidia nvidia-utils
 fi
 
-if lspci | grep -i 'AMD/ATI' &> /dev/null; then
+if lspci | grep -iq 'AMD/ATI'; then
     echo "Detected AMD graphics, installing drivers..."
     pacman -S --noconfirm xf86-video-amdgpu
 fi
 
-# Bootloader install
+# Mount EFI partition for grub (UEFI)
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    pacman -S --noconfirm grub efibootmgr
-    if ! mountpoint -q /boot && [[ -n "${EFI_PART:-}" ]]; then
-        mount "${EFI_PART}" /boot
-    fi
+    mkdir -p /boot
+    mountpoint -q /boot || mount "$EFI_PART" /boot
+fi
+
+# Install and configure GRUB bootloader
+pacman -S --noconfirm grub efibootmgr os-prober
+
+if [[ "$BOOT_MODE" == "UEFI" ]]; then
     grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
 else
-    pacman -S --noconfirm grub
+    # For BIOS + GPT ensure BIOS boot partition exists
+    BIOS_PART_EXISTS=\$(parted "$DISK" print | grep -i bios_grub || true)
+    if [[ -z "\$BIOS_PART_EXISTS" ]]; then
+        echo "WARNING: No BIOS boot partition found on $DISK. Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun the installer."
+        exit 1
+    fi
     grub-install --target=i386-pc "$DISK"
 fi
 
@@ -191,8 +197,10 @@ grub-mkconfig -o /boot/grub/grub.cfg
 EOF
 
 # === 14. Cleanup ===
+echo "Unmounting partitions..."
 umount -R /mnt
 
 # === 15. Done ===
 echo "Installation complete!"
-echo "You can now reboot."
+echo "You can now reboot and boot into your new Arch Linux system."
+
