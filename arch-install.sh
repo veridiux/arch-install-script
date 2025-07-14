@@ -26,19 +26,39 @@ if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
     wipefs -af "$DISK"
     sgdisk -Z "$DISK"
 
+    PART_TABLE_TYPE=$(parted -s "$DISK" print | grep "Partition Table" | awk '{print $3}')
+    echo "Detected partition table type: $PART_TABLE_TYPE"
+
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
         sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"
         sgdisk -n 2:0:0     -t 2:8300 "$DISK"
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
     else
-        sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot
-        sgdisk -n 2:0:0     -t 2:8300 "$DISK"
-        BIOS_BOOT_PART="${DISK}1"
-        ROOT_PART="${DISK}2"
+        if [[ "$PART_TABLE_TYPE" == "gpt" ]]; then
+            echo "BIOS boot with GPT detected. Adding 1MB bios_grub partition..."
+            sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot
+            sgdisk -n 2:0:+512M -t 2:8300 "$DISK"  # /boot (optional)
+            sgdisk -n 3:0:0     -t 3:8300 "$DISK"  # /
+            BIOS_BOOT_PART="${DISK}1"
+            BOOT_PART="${DISK}2"
+            ROOT_PART="${DISK}3"
+        else
+            sfdisk "$DISK" <<EOF
+label: dos
+label-id: 0x$(openssl rand -hex 4)
+device: $DISK
+unit: sectors
+
+$DISK1 : bootable, size=+512M, type=83
+$DISK2 : type=83
+EOF
+            BOOT_PART="${DISK}1"
+            ROOT_PART="${DISK}2"
+        fi
     fi
 else
-    echo "Please partition your disk manually, then press Enter."
+    echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
     read -rp "Enter root partition (e.g., /dev/sda2): " ROOT_PART
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
         read -rp "Enter EFI partition (e.g., /dev/sda1): " EFI_PART
@@ -50,10 +70,15 @@ echo "Choose filesystem for root partition:"
 select FILESYSTEM in ext4 btrfs xfs; do
     [[ -n "$FILESYSTEM" ]] && break
 done
+echo "Formatting $ROOT_PART as $FILESYSTEM..."
 mkfs."$FILESYSTEM" "$ROOT_PART"
 
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
+    echo "Formatting $EFI_PART as FAT32..."
     mkfs.fat -F32 "$EFI_PART"
+elif [[ -n "${BOOT_PART:-}" ]]; then
+    echo "Formatting $BOOT_PART as ext4..."
+    mkfs.ext4 "$BOOT_PART"
 fi
 
 # === 5. Mount Partitions ===
@@ -61,6 +86,9 @@ mount "$ROOT_PART" /mnt
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     mkdir -p /mnt/boot
     mount "$EFI_PART" /mnt/boot
+elif [[ -n "${BOOT_PART:-}" ]]; then
+    mkdir -p /mnt/boot
+    mount "$BOOT_PART" /mnt/boot
 fi
 
 # === 6. Hostname ===
@@ -87,6 +115,7 @@ read -rp "Install NetworkManager? [y/N]: " INSTALL_NET
 read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TOOLS
 
 # === 12. Base Install ===
+echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
 genfstab -U /mnt >> /mnt/etc/fstab
@@ -103,15 +132,18 @@ echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
+# User creation
 useradd -m "$USERNAME"
 echo "$USERNAME:$PASSWORD" | chpasswd
 
+# Sudo
 if [[ "$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm sudo
     usermod -aG wheel "$USERNAME"
     sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 fi
 
+# Desktop Environment
 case $DE in
     GNOME)
         pacman -S --noconfirm gnome gdm
@@ -131,49 +163,45 @@ case $DE in
         ;;
 esac
 
+# Networking
 if [[ "$INSTALL_NET" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm networkmanager
     systemctl enable NetworkManager
 fi
 
+# VMware Tools
 if [[ "$INSTALL_VMWARE_TOOLS" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm open-vm-tools
     systemctl enable --now vmtoolsd
 fi
 
-if lspci | grep -i 'Intel Corporation' &>/dev/null; then
+# Detect and install video drivers
+if lspci | grep -i 'Intel Corporation' &> /dev/null; then
     pacman -S --noconfirm xf86-video-intel
 fi
-if lspci | grep -i 'NVIDIA' &>/dev/null; then
+
+if lspci | grep -i 'NVIDIA' &> /dev/null; then
     pacman -S --noconfirm nvidia nvidia-utils
 fi
-if lspci | grep -i 'AMD/ATI' &>/dev/null; then
+
+if lspci | grep -i 'AMD/ATI' &> /dev/null; then
     pacman -S --noconfirm xf86-video-amdgpu
 fi
-if lspci | grep -i 'VMware' &>/dev/null; then
-    pacman -S --noconfirm xf86-video-vmware
-fi
 
-# === Bootloader Installation ===
+# Bootloader install
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    pacman -S --noconfirm efibootmgr
+    pacman -S --noconfirm grub efibootmgr
     grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 else
-    # BIOS mode
-    if [[ "$(parted -m $DISK print | grep 'gpt')" ]]; then
-        BIOS_PART_FOUND=\$(parted -m $DISK print | grep bios_grub || true)
-        if [[ -z "\$BIOS_PART_FOUND" ]]; then
-            echo "ERROR: BIOS boot partition not found on GPT disk. Installation aborted."
-            exit 1
-        fi
-    fi
+    pacman -S --noconfirm grub
     grub-install --target=i386-pc "$DISK"
 fi
 
 grub-mkconfig -o /boot/grub/grub.cfg
 EOF
 
-# === 14. Cleanup ===
+# === 14. Done ===
 echo "Installation complete!"
-echo "You can chroot with: arch-chroot /mnt"
-echo "Run 'umount -R /mnt && reboot' when ready."
+echo "Now run:"
+echo "    umount -R /mnt"
+echo "    reboot"
