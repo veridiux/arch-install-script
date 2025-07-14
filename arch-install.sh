@@ -1,213 +1,502 @@
 #!/bin/bash
 set -euo pipefail
+shopt -s nocasematch
 
-# === 0. Welcome & Time Sync ===
-echo "=== Arch Linux Interactive Installer ==="
-timedatectl set-ntp true
+# ----------------------------------------
+# Arch Linux Interactive Installer Script
+# Author: ChatGPT Arch Installer v1.0
+# ----------------------------------------
 
-# === 1. Disk Selection ===
-echo "Available disks:"
-lsblk -d -e 7,11 -o NAME,SIZE,MODEL
-read -rp "Enter the target disk (e.g., /dev/sda): " DISK
+# Colors for menu
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-# === 2. Boot Mode Detection ===
-if [ -d /sys/firmware/efi ]; then
-    BOOT_MODE="UEFI"
-else
-    BOOT_MODE="BIOS"
-fi
-echo "Boot mode detected: $BOOT_MODE"
+pause() {
+    read -rp "${YELLOW}Press Enter to continue...${NC}"
+}
 
-# === 3. Partitioning ===
-read -rp "Use automatic partitioning? [y/N]: " AUTO_PART
+info() {
+    echo -e "${CYAN}[INFO]${NC} $1"
+}
 
-EFI_PART=""
-BIOS_BOOT_PART=""
-ROOT_PART=""
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
 
-if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
-    echo "Wiping and partitioning $DISK..."
-    wipefs -af "$DISK"
-    sgdisk -Z "$DISK"
+confirm() {
+    while true; do
+        read -rp "$1 (y/n): " yn
+        case $yn in
+            y|Y ) return 0;;
+            n|N ) return 1;;
+            * ) echo "Please answer y or n.";;
+        esac
+    done
+}
 
-    if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI System
-        sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
-        EFI_PART="${DISK}1"
-        ROOT_PART="${DISK}2"
+# Detect if UEFI or BIOS
+detect_boot_mode() {
+    if [ -d /sys/firmware/efi/efivars ]; then
+        BOOT_MODE="UEFI"
     else
-        # BIOS + GPT requires BIOS boot partition
-        sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot partition
-        sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
-        BIOS_BOOT_PART="${DISK}1"
-        ROOT_PART="${DISK}2"
+        BOOT_MODE="BIOS"
     fi
-else
-    echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
-    read -rp "Enter root partition (e.g., /dev/sda2): " ROOT_PART
-    if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        read -rp "Enter EFI partition (e.g., /dev/sda1): " EFI_PART
+    info "Boot mode detected: $BOOT_MODE"
+}
+
+# List available disks for selection
+list_disks() {
+    echo "Available disks:"
+    lsblk -dno NAME,SIZE,MODEL | grep -v sr0 | nl
+}
+
+select_disk() {
+    while true; do
+        list_disks
+        read -rp "Enter disk number to install Arch on (e.g., 1): " disknum
+        disk=$(lsblk -dno NAME | grep -v sr0 | sed -n "${disknum}p")
+        if [[ -b /dev/$disk ]]; then
+            DISK="/dev/$disk"
+            echo "Selected disk: $DISK"
+            if confirm "Are you sure you want to use $DISK? All data will be erased"; then
+                break
+            fi
+        else
+            error "Invalid disk selection."
+        fi
+    done
+}
+
+# Partitioning menu
+partition_menu() {
+    echo "Partitioning methods:"
+    echo "1) Automatic GPT partitioning (recommended)"
+    echo "2) Manual partitioning (launch cfdisk)"
+    while true; do
+        read -rp "Select partitioning method (1 or 2): " part_choice
+        case $part_choice in
+            1) auto_partition; break;;
+            2) manual_partition; break;;
+            *) echo "Please enter 1 or 2.";;
+        esac
+    done
+}
+
+# Automatic partitioning function (simple GPT scheme)
+auto_partition() {
+    info "Wiping disk $DISK and creating partitions..."
+    # Wipe disk
+    wipefs -a "$DISK"
+    sgdisk --zap-all "$DISK"
+
+    # Create partitions based on boot mode
+    if [[ $BOOT_MODE == "UEFI" ]]; then
+        # Partition 1: EFI System Partition 512M
+        sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI System Partition" "$DISK"
+        # Partition 2: Linux root, rest of disk
+        sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
+        PART_BOOT="${DISK}1"
+        PART_ROOT="${DISK}2"
+    else
+        # BIOS MBR scheme:
+        # Partition 1: BIOS boot partition 1M (if using GRUB with BIOS boot)
+        sgdisk -n 1:0:+1M -t 1:ef02 -c 1:"BIOS boot partition" "$DISK"
+        # Partition 2: Linux root (rest of disk)
+        sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
+        PART_BIOS="${DISK}1"
+        PART_ROOT="${DISK}2"
     fi
-fi
 
-# === 4. Filesystem ===
-echo "Choose filesystem for root partition:"
-select FILESYSTEM in ext4 btrfs xfs; do
-    [[ -n "$FILESYSTEM" ]] && break
-done
-echo "Formatting $ROOT_PART as $FILESYSTEM..."
-mkfs."$FILESYSTEM" "$ROOT_PART"
+    echo "Partitions created:"
+    lsblk "$DISK"
+}
 
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    echo "Formatting EFI partition $EFI_PART as FAT32..."
-    mkfs.fat -F32 "$EFI_PART"
-fi
+manual_partition() {
+    info "Launching cfdisk for manual partitioning..."
+    cfdisk "$DISK"
+    echo "Please make sure you have created necessary partitions."
+    pause
+    # After manual partitioning user will specify partitions later.
+}
 
-# === 5. Mount Partitions ===
-mount "$ROOT_PART" /mnt
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    mkdir -p /mnt/boot
-    mount "$EFI_PART" /mnt/boot
-fi
+# Select filesystem type
+select_filesystem() {
+    echo "Choose filesystem for root partition:"
+    echo "1) ext4 (default, stable)"
+    echo "2) btrfs (advanced, snapshot support)"
+    echo "3) xfs (high performance)"
+    while true; do
+        read -rp "Filesystem choice (1-3): " fs_choice
+        case $fs_choice in
+            1) FS_TYPE="ext4"; break;;
+            2) FS_TYPE="btrfs"; break;;
+            3) FS_TYPE="xfs"; break;;
+            *) echo "Invalid choice.";;
+        esac
+    done
+}
 
-# === 6. Hostname ===
-read -rp "Enter hostname: " HOSTNAME
+# Swap options
+swap_menu() {
+    echo "Swap configuration options:"
+    echo "1) Swap partition"
+    echo "2) Swapfile"
+    echo "3) No swap"
+    while true; do
+        read -rp "Select swap option (1-3): " swap_choice
+        case $swap_choice in
+            1) SWAP_TYPE="partition"; select_swap_partition; break;;
+            2) SWAP_TYPE="file"; break;;
+            3) SWAP_TYPE="none"; break;;
+            *) echo "Invalid choice.";;
+        esac
+    done
+}
 
-# === 7. User Creation ===
-read -rp "Enter username: " USERNAME
-read -rsp "Enter password for $USERNAME: " PASSWORD
-echo
+select_swap_partition() {
+    info "Select existing swap partition or create manually."
+    lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT | grep swap
+    read -rp "Enter swap partition device path (e.g., /dev/sda3): " SWAP_PART
+    if [[ ! -b $SWAP_PART ]]; then
+        error "Invalid swap partition."
+        select_swap_partition
+    fi
+}
 
-# === 8. Desktop Environment ===
-echo "Choose desktop environment:"
-select DE in GNOME KDE XFCE i3 None; do
-    [[ -n "$DE" ]] && break
-done
+# Encryption option
+encryption_menu() {
+    if confirm "Do you want to enable LUKS encryption for the root partition?"; then
+        ENCRYPTION="yes"
+        read -rp "Enter passphrase for LUKS encryption: " -s LUKS_PASS
+        echo
+    else
+        ENCRYPTION="no"
+    fi
+}
 
-# === 9. Sudo ===
-read -rp "Install sudo and allow wheel group? [y/N]: " INSTALL_SUDO
+# Network setup
+network_menu() {
+    echo "Network setup options:"
+    echo "1) Wired (DHCP)"
+    echo "2) Wifi"
+    while true; do
+        read -rp "Choose network type (1 or 2): " net_choice
+        case $net_choice in
+            1) NETWORK_TYPE="wired"; break;;
+            2) NETWORK_TYPE="wifi"; break;;
+            *) echo "Invalid choice.";;
+        esac
+    done
 
-# === 10. Networking ===
-read -rp "Install NetworkManager? [y/N]: " INSTALL_NET
+    if [[ $NETWORK_TYPE == "wifi" ]]; then
+        info "Scanning for wifi networks..."
+        iw dev | grep Interface | awk '{print $2}' | while read -r iface; do
+            WIFI_IFACE="$iface"
+        done
+        if [[ -z $WIFI_IFACE ]]; then
+            error "No wifi interface found."
+            NETWORK_TYPE="wired"
+            return
+        fi
 
-# === 11. VMware Tools ===
-read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TOOLS
+        wifi_scan_and_connect
+    fi
+}
 
-# === 12. Base Install ===
-echo "Installing base system..."
-pacstrap /mnt base linux linux-firmware vim grub os-prober
+wifi_scan_and_connect() {
+    echo "Available WiFi networks:"
+    iw "$WIFI_IFACE" scan | grep SSID | awk -F: '{print $2}' | sed 's/^ *//g' | nl
+    while true; do
+        read -rp "Enter the number of the WiFi network to connect: " ssid_num
+        SSID=$(iw "$WIFI_IFACE" scan | grep SSID | awk -F: '{print $2}' | sed 's/^ *//g' | sed -n "${ssid_num}p")
+        if [[ -n $SSID ]]; then
+            echo "Selected SSID: $SSID"
+            break
+        else
+            echo "Invalid selection."
+        fi
+    done
 
-# Overwrite fstab (don't append)
-genfstab -U /mnt > /mnt/etc/fstab
+    read -rp "Enter WiFi passphrase for $SSID: " -s WIFI_PASS
+    echo
 
-# === 13. Chroot Configuration ===
-arch-chroot /mnt /bin/bash <<EOF
-set -euo pipefail
+    info "Connecting to WiFi..."
+    ip link set "$WIFI_IFACE" up
+    wpa_passphrase "$SSID" "$WIFI_PASS" > /etc/wpa_supplicant.conf
+    wpa_supplicant -B -i "$WIFI_IFACE" -c /etc/wpa_supplicant.conf
+    dhcpcd "$WIFI_IFACE"
+    rm /etc/wpa_supplicant.conf
+}
 
-# Mount virtual filesystems for grub & chroot commands
-mount -t proc /proc /proc
-mount --rbind /sys /sys
-mount --rbind /dev /dev
+# Kernel selection
+kernel_menu() {
+    echo "Select kernel to install:"
+    echo "1) linux (default)"
+    echo "2) linux-lts"
+    echo "3) linux-hardened"
+    while true; do
+        read -rp "Kernel choice (1-3): " kernel_choice
+        case $kernel_choice in
+            1) KERNEL_PKG="linux"; break;;
+            2) KERNEL_PKG="linux-lts"; break;;
+            3) KERNEL_PKG="linux-hardened"; break;;
+            *) echo "Invalid choice.";;
+        esac
+    done
+}
 
-# Mount EFI partition inside chroot for UEFI
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    mkdir -p /boot
-    mountpoint -q /boot || mount "$EFI_PART" /boot
-fi
+# Bootloader menu
+bootloader_menu() {
+    echo "Bootloader options:"
+    echo "1) GRUB"
+    if [[ $BOOT_MODE == "UEFI" ]]; then
+        echo "2) systemd-boot (UEFI only)"
+    fi
+    while true; do
+        read -rp "Select bootloader (1 or 2): " boot_choice
+        if [[ $boot_choice == "1" ]]; then
+            BOOTLOADER="grub"
+            break
+        elif [[ $boot_choice == "2" && $BOOT_MODE == "UEFI" ]]; then
+            BOOTLOADER="systemd-boot"
+            break
+        else
+            echo "Invalid choice."
+        fi
+    done
+}
 
-# Timezone & locale
-ln -sf /usr/share/zoneinfo/UTC /etc/localtime
-hwclock --systohc
+# Desktop Environment menu
+desktop_menu() {
+    echo "Select Desktop Environment:"
+    echo "1) None (CLI only)"
+    echo "2) i3"
+    echo "3) GNOME"
+    echo "4) KDE Plasma"
+    echo "5) XFCE"
+    while true; do
+        read -rp "Choice (1-5): " de_choice
+        case $de_choice in
+            1) DESKTOP_ENV="none"; break;;
+            2) DESKTOP_ENV="i3"; break;;
+            3) DESKTOP_ENV="gnome"; break;;
+            4) DESKTOP_ENV="kde"; break;;
+            5) DESKTOP_ENV="xfce"; break;;
+            *) echo "Invalid choice.";;
+        esac
+    done
+}
 
+# Extra packages menu
+extra_packages_menu() {
+    echo "Select additional package groups to install:"
+    echo "1) None"
+    echo "2) Development tools (gcc, make, git)"
+    echo "3) Multimedia (vlc, mpv, pulseaudio)"
+    echo "4) Networking tools (nmap, net-tools)"
+    echo "You can select multiple by entering numbers separated by spaces (e.g. '2 3'):"
+    read -rp "Your selection: " pkg_choices
+
+    EXTRA_PKGS=()
+    for choice in $pkg_choices; do
+        case $choice in
+            1) break;;
+            2) EXTRA_PKGS+=(base-devel git) ;;
+            3) EXTRA_PKGS+=(vlc mpv pulseaudio pulseaudio-alsa pavucontrol) ;;
+            4) EXTRA_PKGS+=(nmap net-tools) ;;
+            *) echo "Ignoring invalid choice $choice";;
+        esac
+    done
+}
+
+# Locale and timezone
+locale_timezone_menu() {
+    echo "Select your timezone:"
+    timedatectl list-timezones | nl | head -50
+    read -rp "Enter timezone (e.g., Europe/London): " TZONE
+    if ! timedatectl list-timezones | grep -q "^$TZONE$"; then
+        error "Invalid timezone. Using UTC."
+        TZONE="UTC"
+    fi
+
+    read -rp "Enter your locale (e.g., en_US.UTF-8): " LOCALE
+    if [[ -z $LOCALE ]]; then
+        LOCALE="en_US.UTF-8"
+    fi
+
+    read -rp "Enter your hostname: " HOSTNAME
+    if [[ -z $HOSTNAME ]]; then
+        HOSTNAME="archlinux"
+    fi
+}
+
+# Create user account
+create_user() {
+    read -rp "Enter username to create: " USERNAME
+    while true; do
+        read -rsp "Enter password for $USERNAME: " PASS1; echo
+        read -rsp "Confirm password: " PASS2; echo
+        [[ $PASS1 == "$PASS2" ]] && break || echo "Passwords do not match. Try again."
+    done
+}
+
+# Format, mount and install base system
+install_base_system() {
+    info "Starting installation..."
+
+    # Format partitions
+    if [[ $ENCRYPTION == "yes" ]]; then
+        info "Setting up LUKS encryption on root partition $PART_ROOT"
+        echo -n "$LUKS_PASS" | cryptsetup luksFormat "$PART_ROOT" -
+        echo -n "$LUKS_PASS" | cryptsetup open "$PART_ROOT" cryptroot -
+        ROOT_MAPPER="/dev/mapper/cryptroot"
+    else
+        ROOT_MAPPER="$PART_ROOT"
+    fi
+
+    info "Formatting root partition ($ROOT_MAPPER) as $FS_TYPE"
+    case $FS_TYPE in
+        ext4) mkfs.ext4 "$ROOT_MAPPER" ;;
+        btrfs) mkfs.btrfs "$ROOT_MAPPER" ;;
+        xfs) mkfs.xfs "$ROOT_MAPPER" ;;
+    esac
+
+    # Mount root
+    mount "$ROOT_MAPPER" /mnt
+
+    # EFI partition mount
+    if [[ $BOOT_MODE == "UEFI" ]]; then
+        info "Formatting EFI partition $PART_BOOT as FAT32"
+        mkfs.fat -F32 "$PART_BOOT"
+        mkdir -p /mnt/boot
+        mount "$PART_BOOT" /mnt/boot
+    fi
+
+    # Swap setup
+    case $SWAP_TYPE in
+        partition)
+            info "Setting up swap partition $SWAP_PART"
+            mkswap "$SWAP_PART"
+            swapon "$SWAP_PART"
+            ;;
+        file)
+            info "Creating swapfile on root"
+            fallocate -l 2G /mnt/swapfile
+            chmod 600 /mnt/swapfile
+            mkswap /mnt/swapfile
+            swapon /mnt/swapfile
+            ;;
+        none) info "No swap will be configured";;
+    esac
+
+    # Install base system
+    info "Installing base system..."
+    pacstrap /mnt base linux linux-firmware "$KERNEL_PKG" sudo vim
+
+    # Generate fstab
+    info "Generating fstab..."
+    genfstab -U /mnt >> /mnt/etc/fstab
+
+    # Configure system inside chroot
+    arch-chroot /mnt /bin/bash <<EOF
+set -e
 echo "$HOSTNAME" > /etc/hostname
-echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+ln -sf /usr/share/zoneinfo/$TZONE /etc/localtime
+hwclock --systohc
+echo "$LOCALE UTF-8" > /etc/locale.gen
 locale-gen
-echo "LANG=en_US.UTF-8" > /etc/locale.conf
+echo "LANG=$LOCALE" > /etc/locale.conf
+echo "KEYMAP=us" > /etc/vconsole.conf
+useradd -m -G wheel "$USERNAME"
+echo "$USERNAME:$PASS1" | chpasswd
+echo "root:$PASS1" | chpasswd
+echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
+chmod 440 /etc/sudoers.d/wheel
 
-# User creation
-useradd -m "$USERNAME"
-echo "$USERNAME:$PASSWORD" | chpasswd
-
-# Sudo setup
-if [[ "$INSTALL_SUDO" =~ ^[Yy]$ ]]; then
-    pacman -S --noconfirm sudo
-    usermod -aG wheel "$USERNAME"
-    sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+if [[ "$ENCRYPTION" == "yes" ]]; then
+    # Configure mkinitcpio for LUKS
+    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block encrypt filesystems keyboard fsck)/' /etc/mkinitcpio.conf
 fi
 
-# Desktop Environment install and enable services (without systemctl --now)
-case "$DE" in
-    GNOME)
-        pacman -S --noconfirm gnome gdm
+mkinitcpio -P
+
+pacman -S --noconfirm $KERNEL_PKG base linux-firmware sudo vim
+
+# Install extra packages if any
+if [[ ${#EXTRA_PKGS[@]} -gt 0 ]]; then
+    pacman -S --noconfirm ${EXTRA_PKGS[@]}
+fi
+
+# Bootloader installation
+if [[ "$BOOTLOADER" == "grub" ]]; then
+    pacman -S --noconfirm grub
+    if [[ "$BOOT_MODE" == "UEFI" ]]; then
+        pacman -S --noconfirm efibootmgr
+        mkdir -p /boot/EFI
+        grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+    else
+        grub-install --target=i386-pc "$DISK"
+    fi
+    grub-mkconfig -o /boot/grub/grub.cfg
+elif [[ "$BOOTLOADER" == "systemd-boot" ]]; then
+    bootctl install
+    cat <<SYSTEMD_BOOT_CONF > /boot/loader/loader.conf
+default arch
+timeout 3
+editor 0
+SYSTEMD_BOOT_CONF
+
+    cat <<ENTRY > /boot/loader/entries/arch.conf
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options cryptdevice=UUID=$(blkid -s UUID -o value $PART_ROOT):cryptroot root=/dev/mapper/cryptroot rw
+ENTRY
+fi
+
+# Desktop Environment installation
+case $DESKTOP_ENV in
+    i3)
+        pacman -S --noconfirm xorg-server xorg-apps xorg-xinit i3
+        ;;
+    gnome)
+        pacman -S --noconfirm gnome gnome-extra gdm
         systemctl enable gdm
         ;;
-    KDE)
+    kde)
         pacman -S --noconfirm plasma kde-applications sddm
         systemctl enable sddm
         ;;
-    XFCE)
+    xfce)
         pacman -S --noconfirm xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
         systemctl enable lightdm
         ;;
-    i3)
-        pacman -S --noconfirm i3 xorg xterm lightdm lightdm-gtk-greeter
-        systemctl enable lightdm
+    none)
         ;;
 esac
-
-# Networking
-if [[ "$INSTALL_NET" =~ ^[Yy]$ ]]; then
-    pacman -S --noconfirm networkmanager
-    systemctl enable NetworkManager
-fi
-
-# VMware Tools
-if [[ "$INSTALL_VMWARE_TOOLS" =~ ^[Yy]$ ]]; then
-    pacman -S --noconfirm open-vm-tools
-    systemctl enable vmtoolsd
-fi
-
-# Video drivers detection
-if lspci | grep -iq 'Intel Corporation'; then
-    pacman -S --noconfirm xf86-video-intel
-fi
-
-if lspci | grep -iq 'NVIDIA'; then
-    pacman -S --noconfirm nvidia nvidia-utils
-fi
-
-if lspci | grep -iq 'AMD/ATI'; then
-    pacman -S --noconfirm xf86-video-amdgpu
-fi
-
-# Install and configure GRUB bootloader
-pacman -S --noconfirm grub efibootmgr os-prober
-
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    echo "Installing GRUB for UEFI..."
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable || { echo "grub-install failed"; exit 1; }
-else
-    BIOS_PART_EXISTS=\$(parted "$DISK" print | grep -i bios_grub || true)
-    if [[ -z "\$BIOS_PART_EXISTS" ]]; then
-        echo "WARNING: No BIOS boot partition found on $DISK."
-        echo "Please create a 1MB BIOS boot partition with type bios_grub (ef02) and rerun."
-        exit 1
-    fi
-    echo "Installing GRUB for BIOS..."
-    grub-install --target=i386-pc "$DISK" || { echo "grub-install failed"; exit 1; }
-fi
-
-grub-mkconfig -o /boot/grub/grub.cfg || { echo "grub-mkconfig failed"; exit 1; }
-
-# Unmount virtual filesystems
-umount -R /proc /sys /dev || true
-
 EOF
 
-# === 14. Cleanup ===
-echo "Unmounting partitions..."
-umount -R /mnt
+    info "Installation complete! You can now reboot."
+}
 
-# === 15. Done ===
-echo "Installation complete!"
-echo "You can now reboot and boot into your new Arch Linux system."
+# Main script starts here
+clear
+echo -e "${GREEN}Welcome to the Awesome Arch Linux Installer!${NC}"
+
+detect_boot_mode
+select_disk
+partition_menu
+select_filesystem
+swap_menu
+encryption_menu
+network_menu
+kernel_menu
+bootloader_menu
+desktop_menu
+extra_packages_menu
+locale_timezone_menu
+create_user
+install_base_system
