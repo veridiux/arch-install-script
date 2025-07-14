@@ -24,28 +24,31 @@ read -rp "Use automatic partitioning? [y/N]: " AUTO_PART
 if [[ "$AUTO_PART" =~ ^[Yy]$ ]]; then
     echo "Wiping and partitioning $DISK..."
     wipefs -af "$DISK"
-    sgdisk -Z "$DISK"  # Zap GPT and MBR
-    parted -s "$DISK" mklabel gpt  # ← Add this line to create a new GPT
+    sgdisk -Z "$DISK"
+    parted -s "$DISK" mklabel gpt
 
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI System
-        sgdisk -n 2:0:0     -t 2:8300 "$DISK"  # root
+        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"  # EFI System Partition
+        sgdisk -n 2:0:0 -t 2:8300 "$DISK"      # root partition
         EFI_PART="${DISK}1"
         ROOT_PART="${DISK}2"
     else
-        sgdisk -n 1:0:+1M   -t 1:ef02 "$DISK"  # BIOS boot
-        sgdisk -n 2:0:+512M -t 2:8300 "$DISK"  # optional /boot
-        sgdisk -n 3:0:0     -t 3:8300 "$DISK"  # root
+        # BIOS + GPT requires BIOS boot partition + /boot + root
+        sgdisk -n 1:0:+1M -t 1:ef02 "$DISK"    # BIOS boot partition
+        sgdisk -n 2:0:+512M -t 2:8300 "$DISK"  # /boot partition (ext4)
+        sgdisk -n 3:0:0 -t 3:8300 "$DISK"      # root partition
         BIOS_BOOT_PART="${DISK}1"
         BOOT_PART="${DISK}2"
         ROOT_PART="${DISK}3"
     fi
-
 else
     echo "Please partition your disk manually (use cgdisk, fdisk, etc.), then press Enter."
     read -rp "Enter root partition (e.g., /dev/sda2): " ROOT_PART
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
         read -rp "Enter EFI partition (e.g., /dev/sda1): " EFI_PART
+    else
+        read -rp "Enter /boot partition (e.g., /dev/sda1): " BOOT_PART
+        BIOS_BOOT_PART=""  # Assume user made BIOS boot partition if needed
     fi
 fi
 
@@ -54,15 +57,19 @@ echo "Choose filesystem for root partition:"
 select FILESYSTEM in ext4 btrfs xfs; do
     [[ -n "$FILESYSTEM" ]] && break
 done
-echo "Formatting $ROOT_PART as $FILESYSTEM..."
-mkfs."$FILESYSTEM" "$ROOT_PART"
+
+echo "Formatting partitions..."
 
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    echo "Formatting $EFI_PART as FAT32..."
+    echo "Formatting EFI partition ($EFI_PART) as FAT32..."
     mkfs.fat -F32 "$EFI_PART"
+    echo "Formatting root partition ($ROOT_PART) as $FILESYSTEM..."
+    mkfs."$FILESYSTEM" "$ROOT_PART"
 else
-    echo "Formatting $BOOT_PART as ext4..."
+    echo "Formatting /boot partition ($BOOT_PART) as ext4..."
     mkfs.ext4 "$BOOT_PART"
+    echo "Formatting root partition ($ROOT_PART) as $FILESYSTEM..."
+    mkfs."$FILESYSTEM" "$ROOT_PART"
 fi
 
 # === 5. Mount Partitions ===
@@ -102,7 +109,7 @@ read -rp "Install open-vm-tools (VMware guest tools)? [y/N]: " INSTALL_VMWARE_TO
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware vim grub os-prober
 
-genfstab -U /mnt >> /mnt/etc/fstab
+genfstab -U /mnt > /mnt/etc/fstab
 
 # === 13. Chroot Configuration ===
 arch-chroot /mnt /bin/bash <<EOF
@@ -175,28 +182,29 @@ if lspci | grep -i 'AMD/ATI' &> /dev/null; then
     pacman -S --noconfirm xf86-video-amdgpu
 fi
 
-# Install VMware video driver if available
-if lspci | grep -i vmware &> /dev/null; then
-    echo "Detected VMware graphics, installing xf86-video-vmware..."
-    pacman -S --noconfirm xf86-video-vmware || echo "Driver not found in repo."
-fi
-
 # Bootloader install
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     pacman -S --noconfirm grub efibootmgr
-    mountpoint -q /boot || mount "$EFI_PART" /boot
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --removable
 else
     pacman -S --noconfirm grub
-    grub-install --target=i386-pc "$DISK"
+    # BIOS + GPT: check BIOS boot partition presence (skip if user partitioned manually)
+    if [[ -n "$BIOS_BOOT_PART" ]]; then
+        # no need to mount BIOS boot partition
+        grub-install --target=i386-pc --recheck "$DISK"
+    else
+        echo "WARNING: BIOS boot partition not set; grub install might fail!"
+        grub-install --target=i386-pc --recheck "$DISK" || echo "grub-install failed!"
+    fi
 fi
 
 grub-mkconfig -o /boot/grub/grub.cfg
 
 EOF
 
-# === 14. Done ===
+# === 14. Cleanup ===
+umount -R /mnt
+
+# === 15. Done ===
 echo "Installation complete!"
-echo "To finish:"
-echo "  1. Run: umount -R /mnt"
-echo "  2. Run: reboot"
+echo "You can now reboot."
